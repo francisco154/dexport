@@ -289,6 +289,11 @@ export const useStore = create<DexPortState>((set, get) => ({
           const s = get();
           if (s.phase === "desktop") {
             await s.reconnectDesktop();
+          } else if (s.phase === "boot" && !s.bootError) {
+            s.setBootError(
+              "El motor de display se detuvo inesperadamente. Revisa que el dispositivo soporte displays virtuales (Android 10+) y reintenta.",
+              true,
+            );
           }
         },
         onClipboard: (text) => {

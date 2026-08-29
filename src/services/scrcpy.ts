@@ -165,7 +165,6 @@ export class DisplayEngine {
         stayAwake: true,
         powerOn: true,
         cleanup: true,
-        screenOffTimeout: -1,
 
         // ── Red: en web SIEMPRE forward (el navegador no acepta conexiones entrantes) ──
         tunnelForward: true,
