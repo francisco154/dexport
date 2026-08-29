@@ -11,6 +11,8 @@ export interface AppEntry {
   packageName: string;
   label: string;
   system: boolean;
+  /** v3: ícono real (base64 PNG) proveniente del companion original */
+  icon?: string | null;
 }
 
 const POPULAR_APPS: Record<string, string> = {

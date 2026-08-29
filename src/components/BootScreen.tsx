@@ -10,6 +10,7 @@
 import { useEffect, useRef } from "react";
 import { AlertTriangle, RefreshCw, MonitorSmartphone, Usb, ShieldCheck } from "lucide-react";
 import { useStore } from "../store/store";
+import { CompanionInstallCard } from "./CompanionInstall";
 
 function ProgressBar({
   label,
@@ -97,6 +98,9 @@ export function BootScreen() {
             progress={engineBoot.progress}
           />
         </div>
+
+        {/* v3: instalación del launcher original (companion APK) */}
+        <CompanionInstallCard />
 
         {/* Panel de error (como el original: aparece bajo las barras) */}
         {bootError && (

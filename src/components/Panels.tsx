@@ -36,6 +36,7 @@ import {
 import { useStore } from "../store/store";
 import { QUICK_KEYS } from "../utils/androidKeys";
 import { readDeviceFlags, type DeviceFlags } from "../utils/telemetry";
+import { CompanionStatusChip, CompanionInstallCard } from "./CompanionInstall";
 import { useEffect, useState } from "react";
 
 function PanelShell({
@@ -274,6 +275,15 @@ export function DevicePanel() {
         >
           Relanzar launcher en el escritorio
         </button>
+      </div>
+
+      {/* v3: launcher ORIGINAL de Android DEX (companion APK) */}
+      <div className="glass mt-3 rounded-2xl p-3.5">
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#5a606c]">
+          Launcher original (com.shrey.androiddex)
+        </p>
+        <CompanionStatusChip />
+        <CompanionInstallCard compact />
       </div>
 
       <h3 className="mb-3 mt-6 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">

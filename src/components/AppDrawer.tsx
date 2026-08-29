@@ -20,9 +20,20 @@ function AppTile({ app, onLaunch }: { app: AppEntry; onLaunch: (p: string) => vo
   const icon = getAppIcon(app.packageName);
   return (
     <button className="app-tile" onClick={() => onLaunch(app.packageName)} title={app.packageName}>
-      <span className="app-icon" style={{ background: appColor(app.packageName) }}>
-        {appInitial(app.label)}
-      </span>
+      {app.icon ? (
+        // v3: ícono real extraído por el companion original (base64 PNG)
+        <img
+          src={app.icon}
+          alt={app.label}
+          loading="lazy"
+          className="app-icon !bg-transparent object-contain"
+          draggable={false}
+        />
+      ) : (
+        <span className="app-icon" style={{ background: appColor(app.packageName) }}>
+          {appInitial(app.label)}
+        </span>
+      )}
       <span className="max-w-[76px] truncate text-center text-[11px] font-medium text-white/90">
         {app.label}
       </span>

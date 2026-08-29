@@ -238,6 +238,23 @@ export function Landing() {
               dispositivo.
             </p>
           </div>
+          <div className="glass mx-auto mt-4 flex max-w-2xl flex-col gap-3 rounded-2xl p-5 text-[12.5px] leading-relaxed text-[#9499a3] sm:flex-row sm:items-center">
+            <MonitorSmartphone size={18} className="mt-0.5 shrink-0 text-[#7dd3fc]" />
+            <p className="flex-1">
+              <b className="text-[#cfd4dc]">Launcher original incluido:</b> al conectar tu
+              teléfono, DexPort te ofrece instalar el mismo launcher companion del proyecto
+              original (<span className="font-mono text-[11.5px]">com.shrey.androiddex</span> v1.2)
+              por WebADB — sin PC, con un clic. Aporta el escritorio HOME en el display virtual,
+              fondos DeX y el análisis de apps con íconos reales.
+            </p>
+            <a
+              href="androiddex-launcher.apk"
+              download
+              className="btn-outline shrink-0 !py-2 !text-[12px]"
+            >
+              Descargar APK (44 MB)
+            </a>
+          </div>
         </section>
 
         {/* ── Footer / créditos ── */}

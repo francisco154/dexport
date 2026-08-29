@@ -2,11 +2,18 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
+  "rewrites": [{ "source": "/((?!androiddex-launcher\\.apk|scrcpy-server).*)", "destination": "/index.html" }],
   "headers": [
     {
       "source": "/scrcpy-server",
       "headers": [{ "key": "Content-Type", "value": "application/octet-stream" }]
+    },
+    {
+      "source": "/androiddex-launcher.apk",
+      "headers": [
+        { "key": "Content-Type", "value": "application/vnd.android.package-archive" },
+        { "key": "Cache-Control", "value": "public, max-age=86400" }
+      ]
     },
     {
       "source": "/(.*)",

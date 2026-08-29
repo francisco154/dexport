@@ -12,6 +12,7 @@ import { AppDrawer } from "./AppDrawer";
 import { MediaPanel, DevicePanel, SettingsPanel, ShortcutsModal } from "./Panels";
 import { ReconnectOverlay } from "./ReconnectOverlay";
 import { Toasts } from "./Toasts";
+import { CompanionPromptFloat } from "./CompanionInstall";
 import { useStore } from "../store/store";
 
 export function DesktopShell() {
@@ -32,6 +33,7 @@ export function DesktopShell() {
       </main>
 
       <Taskbar />
+      <CompanionPromptFloat />
       <ReconnectOverlay />
       <Toasts />
     </div>

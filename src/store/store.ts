@@ -23,6 +23,11 @@
 import { create } from "zustand";
 import { webAdb, type DeviceInfo } from "../services/adb";
 import {
+  companion,
+  type InstallProgress,
+} from "../services/companion";
+import { companionBridge } from "../services/companionBridge";
+import {
   DisplayEngine,
   DEFAULT_DISPLAY_SETTINGS,
   type DisplaySettings,
@@ -52,6 +57,12 @@ export interface PanelState {
   shortcutsOpen: boolean;
 }
 
+/**
+ * v3 — flujo del LAUNCHER ORIGINAL (companion APK com.shrey.androiddex).
+ * Estado de la instalación/uso del launcher extraído del release oficial.
+ */
+export type CompanionFlow = "idle" | "checking" | "prompt" | "installing" | "ready" | "skipped";
+
 interface DexPortState {
   // ── Fase global ──
   phase: Phase;
@@ -80,6 +91,12 @@ interface DexPortState {
   mirrorMode: boolean;
   /** v2: launcher detectado (para relanzar HOME en el display) */
   launcherPkg: string | null;
+
+  // ── v3: launcher original (companion APK) ──
+  companionFlow: CompanionFlow;
+  companionInstalled: boolean;
+  companionVersion: string | null;
+  companionInstall: InstallProgress;
 
   // ── Telemetría (AndroidCore port) ──
   battery: BatteryState | null;
@@ -117,6 +134,11 @@ interface DexPortState {
   launchHome: () => Promise<void>;
   /** v2: flujo post-display: launcher + HOME en el display virtual */
   initDesktopAfterDisplay: (displayId: number) => Promise<void>;
+  /** v3: instalar/lanzar el launcher original */
+  checkCompanion: () => Promise<boolean>;
+  installCompanion: (autoLaunch?: boolean) => Promise<void>;
+  skipCompanion: () => void;
+  launchCompanionHome: () => Promise<boolean>;
   refreshApps: () => Promise<void>;
   refreshTelemetry: () => Promise<void>;
   refreshRunningApps: () => Promise<void>;
@@ -177,6 +199,11 @@ export const useStore = create<DexPortState>((set, get) => ({
   controlOnline: false,
   mirrorMode: false,
   launcherPkg: null,
+
+  companionFlow: "idle",
+  companionInstalled: false,
+  companionVersion: null,
+  companionInstall: { phase: "idle", progress: 0, message: "" },
 
   battery: null,
   mediaSessions: [],
@@ -409,11 +436,35 @@ export const useStore = create<DexPortState>((set, get) => ({
         20_000,
       );
 
-      // ── 0.93→1.00: telemetría + apps EN BACKGROUND (fix del cuelgue) ──
+      // ── 0.93→1.00: launcher original + apps EN BACKGROUND ──
       store.setAppBoot({
         message: "Preparando escritorio…",
         progress: 0.93,
       });
+
+      // v3: si el LAUNCHER ORIGINAL está por instalarse (companion APK del
+      // release oficial), esperamos la decisión del usuario — la tarjeta de
+      // instalación con progreso está visible en este mismo boot screen,
+      // igual que el instalador del companion del original.
+      await waitFor(
+        () => {
+          const f = get().companionFlow;
+          return f === "ready" || f === "skipped" || f === "prompt" || f === "installing";
+        },
+        18_000,
+      );
+      const cf = get().companionFlow;
+      if (cf === "prompt" || cf === "installing") {
+        // decisión/instalación en curso — esperar (máx. 10 min de cortesía)
+        await waitFor(
+          () => {
+            const f = get().companionFlow;
+            return f === "ready" || f === "skipped";
+          },
+          600_000,
+        );
+      }
+
       // NO se espera: el boot completa y la sync sigue de fondo
       void get().refreshApps().then(() => {
         const s = get();
@@ -484,11 +535,97 @@ export const useStore = create<DexPortState>((set, get) => ({
     }
   },
 
+  /**
+   * v3: instalación del LAUNCHER ORIGINAL (companion APK del release
+   * oficial de Android-Dex) — el mismo `installApk()` del escritorio
+   * original pero vía WebADB: fetch → sync push → pm install -r.
+   */
+  checkCompanion: async () => {
+    set({ companionFlow: "checking" });
+    try {
+      const installed = await companion.isInstalled();
+      const version = installed ? await companion.getVersion() : null;
+      set({ companionInstalled: installed, companionVersion: version });
+      return installed;
+    } catch {
+      set({ companionInstalled: false });
+      return false;
+    } finally {
+      // el estado de flujo lo decide quien llama (prompt/ready/skipped)
+    }
+  },
+
+  installCompanion: async (autoLaunch = true) => {
+    if (get().companionFlow === "installing") return;
+    set({
+      companionFlow: "installing",
+      companionInstall: { phase: "downloading", progress: 0, message: "Iniciando instalación…" },
+    });
+    try {
+      await companion.install((p) => set({ companionInstall: p }));
+      set({ companionInstalled: true, companionFlow: "ready" });
+      get().toast("Launcher AndroidDex (original) instalado ✓", "success");
+
+      // arrancar el puente del companion (como el escritorio original)
+      void companion.startBridge();
+
+      if (autoLaunch) {
+        const displayId = get().displayId;
+        if (displayId != null && displayId > 0) {
+          set({ companionInstall: { phase: "launching", progress: 0.5, message: "Abriendo el launcher en el display virtual…" } });
+          const ok = await companion.launchOnDisplay(displayId);
+          set({ companionInstall: { phase: "done", progress: 1, message: ok ? "Launcher abierto ✓" : "Instalado — pulsa HOME para abrirlo" } });
+          if (ok) get().toast("Launcher AndroidDex abierto en el escritorio ✓", "success");
+        } else {
+          set({ companionInstall: { phase: "done", progress: 1, message: "Instalado ✓" } });
+        }
+      }
+      void get().refreshApps();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      set({
+        companionFlow: get().companionInstalled ? "ready" : "prompt",
+        companionInstall: { phase: "error", progress: 0, message: "", error: msg },
+      });
+      get().toast(`Instalación fallida: ${msg.slice(0, 120)}`, "error");
+    }
+  },
+
+  skipCompanion: () => {
+    set({ companionFlow: "skipped" });
+  },
+
+  /** v3: abre el launcher original en el display virtual actual. */
+  launchCompanionHome: async () => {
+    const displayId = get().displayId;
+    if (displayId == null || displayId <= 0) {
+      get().toast("Sin display virtual activo", "error");
+      return false;
+    }
+    const ok = await companion.launchOnDisplay(displayId);
+    if (!ok) get().toast("No se pudo abrir el launcher AndroidDex", "error");
+    return ok;
+  },
+
   launchHome: async () => {
     const displayId = get().displayId;
+    // v3: el launcher ORIGINAL (companion) tiene prioridad — es el mismo
+    // comportamiento del escritorio original (HOME = MainActivity del APK)
+    if (get().companionInstalled && displayId != null && displayId > 0) {
+      const ok = await companion.launchOnDisplay(displayId);
+      if (ok) return;
+    }
     if (displayId != null && displayId > 0) {
+      // fallback: launcher del teléfono en el display virtual
       const ok = await webAdb.launchHomeOnDisplay(displayId);
-      if (!ok) get().toast("No se pudo abrir el launcher", "error");
+      if (ok) return;
+      // último recurso: HOME del launcher detectado por componente explícito
+      const launcher = get().launcherPkg;
+      if (launcher) {
+        const launched = await webAdb.launchOnDisplay(launcher, displayId);
+        if (launched) return;
+      }
+      get().toast("No se pudo abrir el launcher — usa el botón del panel Dispositivo", "error");
     } else {
       get().sendKeyAction(3); // KEYCODE_HOME
     }
@@ -504,22 +641,46 @@ export const useStore = create<DexPortState>((set, get) => ({
     const s = get();
     if (s.phase !== "boot" && s.phase !== "desktop") return;
     try {
-      // 1) launcher por defecto
+      // 1) launcher por defecto del teléfono (fallback)
       const launcher = await webAdb.getDefaultLauncher();
       set({ launcherPkg: launcher });
 
-      // 2) HOME en el display virtual → escritorio real (wallpaper + grid)
+      // 2) v3: ¿está instalado el LAUNCHER ORIGINAL (companion)?
+      const installed = await s.checkCompanion();
+      if (installed) {
+        // puente del companion arriba (como el original al conectar)
+        void companion.startBridge();
+        const ok = await companion.launchOnDisplay(displayId);
+        set({ companionFlow: "ready" });
+        if (ok) {
+          get().toast(
+            "Launcher AndroidDex (original) abierto en el escritorio ✓",
+            "success",
+          );
+          void get().refreshRunningApps();
+          return;
+        }
+      } else {
+        // no instalado → pedir confirmación al usuario (44 MB)
+        set({ companionFlow: "prompt" });
+        get().toast(
+          "Launcher original de Android DEX no instalado — instálalo para el escritorio completo",
+          "info",
+        );
+      }
+
+      // 3) fallback: HOME del teléfono en el display virtual
       const ok = await webAdb.launchHomeOnDisplay(displayId);
       if (ok) {
         get().toast(
           launcher
-            ? `Launcher (${launcher}) abierto en el display #${displayId}`
-            : "Launcher abierto en el display virtual",
+            ? `Launcher del teléfono (${launcher}) abierto en el display #${displayId}`
+            : "Launcher del teléfono abierto en el display virtual",
           "success",
         );
       }
 
-      // 3) refrescar apps visibles
+      // 4) refrescar apps visibles
       void get().refreshRunningApps();
     } catch {
       /* el display ya funciona — el launcher es un extra */
@@ -529,6 +690,45 @@ export const useStore = create<DexPortState>((set, get) => ({
   refreshApps: async () => {
     set({ appsLoading: true });
     try {
+      // v3: si el LAUNCHER ORIGINAL está instalado, pedir la lista REAL
+      // (nombres + íconos + sistema/usuario) al puente 8457 del companion —
+      // exactamente el canal que usaba el JAR del original (get_all_apps).
+      if (get().companionInstalled) {
+        try {
+          const apps = await companionBridge.getApps();
+          if (apps.length > 0) {
+            set({
+              userApps: apps
+            .filter((a) => !a.isSystem && a.packageName)
+            .map((a) => ({
+              packageName: a.packageName,
+              label: a.appName || a.packageName,
+              system: false,
+              icon: a.icon,
+            }))
+            .sort((a, b) => a.label.localeCompare(b.label)),
+              systemApps: apps
+            .filter((a) => a.isSystem && a.packageName)
+            .map((a) => ({
+              packageName: a.packageName,
+              label: a.appName || a.packageName,
+              system: true,
+              icon: a.icon,
+            }))
+            .sort((a, b) => a.label.localeCompare(b.label)),
+              appsLoading: false,
+            });
+            get().toast(
+              `Apps analizadas por el companion original: ${apps.length} total`,
+              "success",
+            );
+            return;
+          }
+        } catch {
+          /* puente caído → fallback a pm list */
+        }
+      }
+
       const [userOut, sysOut] = await Promise.all([
         webAdb.listPackages("user"),
         webAdb.listPackages("system"),
@@ -541,6 +741,35 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   refreshTelemetry: async () => {
+    // v3: batería por el puente del companion original (BatteryMonitor)
+    // con fallback al polling shell de la v2.
+    if (get().companionInstalled) {
+      try {
+        const cb = await companionBridge.getBattery();
+        if (cb && cb.percentage > 0) {
+          set({
+            battery: {
+              percentage: cb.percentage,
+              charging: cb.charging,
+              temperature: cb.temperature ?? null,
+              voltage: cb.voltage ?? null,
+              currentMa: cb.currentMa ?? null,
+              health: cb.health || null,
+              technology: cb.technology || null,
+            },
+          });
+          // media sessions siguen por dumpsys (no soportadas por el puente local)
+          const { mediaSessions, volumes } = await pollTelemetryBatch();
+          set({
+            mediaSessions,
+            ...(volumes ? { volume: volumes.music / Math.max(1, volumes.musicMax) } : {}),
+          });
+          return;
+        }
+      } catch {
+        /* puente caído → fallback */
+      }
+    }
     try {
       const { battery, mediaSessions, volumes } = await pollTelemetryBatch();
       set({
@@ -681,6 +910,10 @@ export const useStore = create<DexPortState>((set, get) => ({
       controlOnline: false,
       mirrorMode: false,
       launcherPkg: null,
+      companionFlow: "idle",
+      companionInstalled: false,
+      companionVersion: null,
+      companionInstall: { phase: "idle", progress: 0, message: "" },
       panels: {
         drawerOpen: false,
         mediaOpen: false,
