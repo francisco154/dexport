@@ -6,7 +6,7 @@
  * (batería, settings, reloj, fullscreen).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Home,
   ChevronLeft,
@@ -27,10 +27,166 @@ import {
   MonitorSmartphone,
   Music2,
   Info,
+  AppWindow,
+  Expand,
+  Minus,
+  Square,
+  X,
 } from "lucide-react";
 import { displayEngine, useStore } from "../store/store";
 import { webAdb } from "../services/adb";
 import { QUICK_KEYS } from "../utils/androidKeys";
+import { appColor, appInitial, type AppEntry } from "../utils/appNames";
+import type { TaskInfo } from "../utils/telemetry";
+
+type TaskActionName = "front" | "minimize" | "kill" | "freeform" | "fullscreen";
+
+/**
+ * v7: menú contextual estilo Windows para una tarea de la franja.
+ */
+function TaskContextMenu({
+  task,
+  entry,
+  x,
+  y,
+  onAction,
+  onClose,
+}: {
+  task: TaskInfo;
+  entry?: AppEntry;
+  x: number;
+  y: number;
+  onAction: (a: TaskActionName) => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const close = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as globalThis.Node)) onClose();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("blur", onClose);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("blur", onClose);
+    };
+  }, [onClose]);
+
+  const top = Math.min(y, window.innerHeight - 300);
+  const left = Math.min(x, window.innerWidth - 230);
+  const item = (label: string, icon: React.ReactNode, action: TaskActionName, danger = false) => (
+    <button
+      className={`task-ctx-item ${danger ? "danger" : ""}`}
+      onClick={() => {
+        onAction(action);
+        onClose();
+      }}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+
+  return (
+    <div ref={ref} className="task-ctx fade-in" style={{ top, left }}>
+      <div className="px-2.5 pb-1.5 pt-1 text-[10px] font-semibold uppercase tracking-wider text-[#5a606c]">
+        {entry?.label ?? task.packageName}
+      </div>
+      {item("Traer al frente", <Maximize2 size={14} />, "front")}
+      {item("Abrir en ventana", <AppWindow size={14} />, "freeform")}
+      {item("Pantalla completa", <Expand size={14} />, "fullscreen")}
+      {item("Minimizar", <Minus size={14} />, "minimize")}
+      <div className="mx-2 my-1 h-px bg-white/10" />
+      {item("Cerrar (forzar)", <Square size={12} />, "kill", true)}
+    </div>
+  );
+}
+
+/**
+ * v7: franja de tareas estilo Windows — apps abiertas en el escritorio.
+ * · clic → traer al frente (o minimizar si ya está enfocada)
+ * · clic derecho → menú contextual completo
+ */
+function RunningTasksStrip() {
+  const runningApps = useStore((s) => s.runningApps);
+  const displayId = useStore((s) => s.displayId);
+  const userApps = useStore((s) => s.userApps);
+  const systemApps = useStore((s) => s.systemApps);
+  const taskAction = useStore((s) => s.taskAction);
+  const [menu, setMenu] = useState<{
+    task: TaskInfo;
+    entry?: AppEntry;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const byPkg = useMemo(() => {
+    const m = new Map<string, AppEntry>();
+    for (const a of userApps) m.set(a.packageName, a);
+    for (const a of systemApps) m.set(a.packageName, a);
+    return m;
+  }, [userApps, systemApps]);
+
+  const vd = displayId ?? -1;
+  // una entrada por app (la tarea superior); solo apps del display virtual
+  const tasks = useMemo(() => {
+    const seen = new Set<string>();
+    const out: TaskInfo[] = [];
+    for (const t of runningApps) {
+      if (t.displayId !== vd) continue;
+      if (seen.has(t.packageName)) continue;
+      seen.add(t.packageName);
+      out.push(t);
+    }
+    return out.slice(0, 12);
+  }, [runningApps, vd]);
+
+  if (tasks.length === 0) return null;
+
+  return (
+    <div
+      className="scrollable-x flex items-center gap-1"
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {tasks.map((t) => {
+        const entry = byPkg.get(t.packageName);
+        return (
+          <button
+            key={`${t.taskId}-${t.packageName}`}
+            className={`task-app ${t.focused ? "is-focused" : "is-open"}`}
+            title={
+              `${entry?.label ?? t.packageName}\n` +
+              `clic: traer al frente · clic derecho: más acciones`
+            }
+            onClick={() => void taskAction(t, t.focused ? "minimize" : "front")}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setMenu({ task: t, entry, x: e.clientX, y: e.clientY - 8 });
+            }}
+          >
+            {entry?.icon ? (
+              <img src={entry.icon} alt={entry.label} draggable={false} />
+            ) : (
+              <span className="app-icon" style={{ background: appColor(t.packageName) }}>
+                {appInitial(entry?.label ?? t.packageName)}
+              </span>
+            )}
+          </button>
+        );
+      })}
+      {menu && (
+        <TaskContextMenu
+          task={menu.task}
+          entry={menu.entry}
+          x={menu.x}
+          y={menu.y}
+          onAction={(a) => void taskAction(menu.task, a)}
+          onClose={() => setMenu(null)}
+        />
+      )}
+    </div>
+  );
+}
 
 function Clock() {
   const [now, setNow] = useState(new Date());
@@ -149,7 +305,8 @@ export function Taskbar() {
   const setAudioMuted = useStore((s) => s.setAudioMuted);
   const settings = useStore((s) => s.settings);
   const sendKeyAction = useStore((s) => s.sendKeyAction);
-  const launchHome = useStore((s) => s.launchHome);
+  const sendNavKey = useStore((s) => s.sendNavKey);
+  const goHomeSmart = useStore((s) => s.goHomeSmart);
   const controlOnline = useStore((s) => s.controlOnline);
   const displayId = useStore((s) => s.displayId);
   const runningApps = useStore((s) => s.runningApps);
@@ -175,22 +332,22 @@ export function Taskbar() {
       <div className="flex items-center gap-1">
         <button
           className="taskbar-btn"
-          title="Inicio — abre el launcher del teléfono en el escritorio"
-          onClick={() => void launchHome()}
+          title="Inicio — launcher del escritorio (instantáneo)"
+          onClick={() => void goHomeSmart()}
         >
           <Home size={19} />
         </button>
         <button
           className="taskbar-btn"
-          title="Atrás (Back)"
-          onClick={() => sendKey(QUICK_KEYS.back)}
+          title="Atrás — dirigido al escritorio (display virtual)"
+          onClick={() => void sendNavKey(QUICK_KEYS.back)}
         >
           <ChevronLeft size={21} />
         </button>
         <button
-          className="taskbar-btn"
-          title="Recientes (App Switch)"
-          onClick={() => sendKey(QUICK_KEYS.recents)}
+          className={`taskbar-btn ${panels.taskViewOpen ? "bg-white/12 text-white" : ""}`}
+          title="Apps abiertas — vista de tareas estilo Windows"
+          onClick={() => togglePanel("taskViewOpen")}
         >
           <ChevronUp size={19} />
         </button>
@@ -206,7 +363,7 @@ export function Taskbar() {
           className={`ml-1 h-2 w-2 rounded-full ${controlOnline ? "bg-[#3ddc84]" : "bg-[#f59e0b] pulse-glow"}`}
           title={
             controlOnline
-              ? `Control activo (mouse/teclado) · ${runningApps.length} app(s) visible(s)${displayId != null ? ` · Display #${displayId}` : ""}`
+              ? `Control activo (mouse/teclado) · ${runningApps.length} tarea(s)${displayId != null ? ` · Display #${displayId}` : ""}`
               : "Canal de control no disponible — los botones usan comandos shell (más lentos)"
           }
         />
@@ -214,6 +371,9 @@ export function Taskbar() {
       )}
 
       <div className="mx-1 h-8 w-px bg-white/10" />
+
+      {/* ── v7: franja de apps abiertas (estilo Windows) ── */}
+      <RunningTasksStrip />
 
       {/* ── Mini media player (como el original) ── */}
       <MiniMediaPlayer />

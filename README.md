@@ -9,6 +9,17 @@ teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
 > 🔗 **Demo en vivo:** <https://dexport-app.vercel.app>
 
+> 🚀 **v7** — **Gestión de ventanas estilo Windows**: el botón «Recientes»
+> ya no abre los recientes del teléfono — abre la nueva vista **«Apps
+> abiertas»** con las tareas reales del display virtual. La barra de tareas
+> muestra las apps abiertas (ícono + indicador de foco) con clic = traer al
+> frente / minimizar y **clic derecho = menú de Windows** (traer al frente,
+> abrir en ventana freeform, pantalla completa, minimizar, cerrar).
+> «Atrás» ahora se dirige **al escritorio** (`input -d <display> keyevent`)
+> en lugar de irse al teléfono, y «Inicio» es instantáneo con auto-reparación
+> del launcher. Minimizar = `am move-task` (la app sigue viva en el teléfono
+> y se restaura al escritorio con un clic).
+
 > 🚀 **v3** — **Launcher original incluido**: el APK companion del proyecto
 > original (`com.shrey.androiddex` v1.2, extraído del release oficial por
 > ingeniería inversa) se sirve byte-idéntico y se **instala por WebADB con un

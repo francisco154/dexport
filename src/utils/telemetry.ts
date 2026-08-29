@@ -58,6 +58,156 @@ export interface RunningApp {
   displayId: number;
 }
 
+/**
+ * v7: tarea Android completa — la unidad de la gestión de ventanas
+ * estilo Windows (taskbar con apps abiertas + TaskView).
+ */
+export interface TaskInfo {
+  taskId: number;
+  packageName: string;
+  /** componente "pkg/.Activity" de la actividad superior de la tarea */
+  activity: string | null;
+  displayId: number;
+  /** tipo de tarea: standard | home | … */
+  type: string | null;
+  visible: boolean;
+  /** tarea superior (foco) de su display */
+  focused: boolean;
+}
+
+/** Comando único (1 stream ADB) con el inventario de tareas + foco global. */
+export const TASK_DUMP_COMMAND =
+  "timeout 4 dumpsys activity activities 2>/dev/null" +
+  " | grep -E 'Display #[0-9]+|displayId=[0-9]+ rootTaskId|Task\\{|TaskRecord\\{|ActivityRecord\\{|type=[a-z]+|mCurrentFocus" +
+  " | head -170; echo __FOCUS__; timeout 3 dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -2";
+
+/** Normaliza "pkg" + activity (.Main | Main | com.x.Main) → componente am start. */
+function buildComponent(pkg: string, act: string): string {
+  if (act.startsWith(".")) return `${pkg}/${act}`;
+  if (act.includes(".")) return `${pkg}/${act}`; // clase completa
+  return `${pkg}/.${act}`;
+}
+
+/** Extrae el paquete de la línea de foco de dumpsys window. */
+export function parseCurrentFocus(out: string): string | null {
+  const m = out.match(/m(?:CurrentFocus|FocusedApp)[^=]*=\s*(?:Window\{[^}]*?\s)?([a-zA-Z][a-zA-Z0-9_.]*)\//);
+  return m ? m[1] : null;
+}
+
+/**
+ * v7: port del AppMonitor + TaskStackMonitor del servidor original.
+ * `dumpsys activity activities` → tareas por display con taskId + activity.
+ *
+ * Formatos tolerados:
+ *   Android 10/11:  Display #2 ... / TaskRecord{... #123 A=10285:com.x u0 ...}
+ *                   / Hist #0: ActivityRecord{... u0 com.x/.Main t123}
+ *   Android 12+:    displayId=2 rootTaskId=44 / * Task{... #123 type=standard
+ *                   A=10285:com.x visible=true} / * ActivityRecord{... u0 com.x/.Main t123}
+ *   Samsung One UI: variantes con espacios y orden distinto.
+ *
+ * `focusInfo` = salida de `dumpsys window | grep mCurrentFocus` (foco GLOBAL:
+ * si el paquete enfocado tiene tarea en el display virtual, esa tarea queda
+ * marcada como focused — el resto se deduce por orden top-down del dump).
+ */
+export function parseTasks(dump: string, focusInfo?: string): TaskInfo[] {
+  if (!dump) return [];
+  const focusPkg = focusInfo ? parseCurrentFocus(focusInfo) : null;
+  const tasks = new Map<number, TaskInfo>();
+  let displayId = 0;
+  const topByDisplay = new Map<number, number>(); // primer taskId visto por display
+
+  for (const rawLine of dump.split("\n")) {
+    const line = rawLine.trim();
+    // ── cambio de display (formato antiguo "Display #N" o nuevo "displayId=N") ──
+    const dOld = line.match(/^Display #(\d+)/);
+    const dNew = line.match(/^displayId=(\d+)\s+rootTaskId/);
+    if (dOld || dNew) {
+      displayId = Number((dOld ?? dNew)![1]);
+      continue;
+    }
+    // ── Task{... #123 type=standard A=10285:com.x ... visible=true} ──
+    //    TaskRecord{... #123 A=10285:com.x ...}   (Android ≤11) ──
+    const t = line.match(/^(?:\* )?(?:Task|TaskRecord)\{[^}]*? #(\d+)([^}]*)\}/);
+    if (t) {
+      const taskId = Number(t[1]);
+      const rest = t[2];
+      const pkg = rest.match(/\bA=(-?\d+):([a-zA-Z][a-zA-Z0-9_.]*)/)?.[2] ?? null;
+      const type = rest.match(/\btype=([a-z]+)/)?.[1] ?? null;
+      const visible = /\bvisible=true\b/.test(rest) || !/\bvisible=false\b/.test(rest);
+      if (pkg && pkg !== "com.android.systemui" && !tasks.has(taskId)) {
+        tasks.set(taskId, {
+          taskId,
+          packageName: pkg,
+          activity: null,
+          displayId,
+          type,
+          visible,
+          focused: false,
+        });
+        if (!topByDisplay.has(displayId)) topByDisplay.set(displayId, taskId);
+      }
+      continue;
+    }
+    // ── ActivityRecord{... u0 com.x/.Main t123} / Hist #0: ActivityRecord{...} ──
+    //    la parte de la activity puede ser relativa (.Main) o completa (com.x.Main)
+    const a = line.match(
+      /ActivityRecord\{[^}]*?\b(?:u\d+ )?([a-zA-Z][a-zA-Z0-9_.]*)\/([\w$.]+)\s+t(\d+)/,
+    );
+    if (a) {
+      const pkg = a[1];
+      const act = a[2];
+      const taskId = Number(a[3]);
+      const task = tasks.get(taskId);
+      if (task && task.packageName === pkg) {
+        task.activity = buildComponent(pkg, act);
+      } else if (!task && pkg !== "com.android.systemui") {
+        // ActivityRecord sin Task{} previo (algunos Samsung) — se asume el
+        // display en curso
+        tasks.set(taskId, {
+          taskId,
+          packageName: pkg,
+          activity: buildComponent(pkg, act),
+          displayId,
+          type: null,
+          visible: true,
+          focused: false,
+        });
+        if (!topByDisplay.has(displayId)) topByDisplay.set(displayId, taskId);
+      }
+    }
+  }
+
+  const list = [...tasks.values()];
+  for (const [disp, taskId] of topByDisplay) {
+    const task = list.find((t) => t.taskId === taskId);
+    if (task) task.focused = true; // top del display
+  }
+  // el foco GLOBAL (dumpsys window) refina: solo una tarea marcada
+  if (focusPkg) {
+    const withPkg = list.filter((t) => t.packageName === focusPkg);
+    if (withPkg.length > 0) {
+      for (const t of list) t.focused = false;
+      // preferir la tarea del display virtual (la que ve el usuario)
+      const vdTask =
+        withPkg.find((t) => t.displayId !== 0) ?? withPkg[withPkg.length - 1];
+      vdTask.focused = true;
+    }
+  }
+  return list;
+}
+
+/**
+ * Compatibilidad v2-v6: apps visibles por display (el watchdog del launcher
+ * y el tooltip de la taskbar siguen usando esta forma).
+ */
+export function parseRunningApps(out: string, onlyDisplayId?: number | null): RunningApp[] {
+  const tasks = parseTasks(out);
+  const apps = tasks.map((t) => ({ packageName: t.packageName, displayId: t.displayId }));
+  return onlyDisplayId != null && onlyDisplayId > 0
+    ? apps.filter((a) => a.displayId === onlyDisplayId)
+    : apps;
+}
+
 /** dumpsys battery → BatteryState (port del parser del original) */
 export function parseBattery(out: string): BatteryState | null {
   if (!out || !out.includes("level:")) return null;
@@ -143,49 +293,6 @@ export function parseMediaSessions(out: string): MediaSession[] {
     }
   }
   return sessions;
-}
-
-/**
- * v2/v5: port del AppMonitor del servidor original.
- * `dumpsys activity activities` → apps visibles por display.
- *
- * Formatos tolerados (Android 10 → 15 / Samsung One UI):
- *   Display #2 (from top to bottom):
- *     Task{8f2f #4 type=standard A=10285:com.whatsapp U=0 ... visible=true}
- *     TaskRecord{1a2b #7 A=14:com.shrey.androiddex u0 ...}
- *   (v4 exigía `visible=true` literal en la misma línea y el formato
- *    exacto `A=x:pkg U=y` → fallaba en muchos Samsung; v5 captura el
- *    paquete siempre y trata la visibilidad como secundaria)
- */
-export function parseRunningApps(out: string, onlyDisplayId?: number | null): RunningApp[] {
-  if (!out) return [];
-  const apps: RunningApp[] = [];
-  let displayId = 0;
-  const seen = new Set<string>();
-  for (const line of out.split("\n")) {
-    const d = line.match(/Display #(\d+)/);
-    if (d) {
-      displayId = Number(d[1]);
-      continue;
-    }
-    // Task{... A=123:com.pkg ...} o TaskRecord{... A=123:com.pkg ...}
-    const t = line.match(/(?:Task|TaskRecord)\{[^}]*?\bA=(-?\d+):([a-zA-Z][a-zA-Z0-9_.]*)/);
-    if (t) {
-      const pkg = t[2];
-      // descartar systemui del conteo de "apps"
-      if (pkg === "com.android.systemui") continue;
-      // visibilidad secundaria: si la línea declara visible=false explícito → no contar
-      if (/\bvisible=false\b/.test(line)) continue;
-      const key = `${displayId}:${pkg}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        apps.push({ packageName: pkg, displayId });
-      }
-    }
-  }
-  return onlyDisplayId != null && onlyDisplayId > 0
-    ? apps.filter((a) => a.displayId === onlyDisplayId)
-    : apps;
 }
 
 /**

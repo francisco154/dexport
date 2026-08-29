@@ -446,6 +446,86 @@ export class WebAdbService {
     await this.shellSafe(`input keyevent ${keycode}`, 6_000);
   }
 
+  /**
+   * v7: keyevent DIRIGIDO a un display concreto — el fix de «ATRÁS funciona
+   * a medias». El `input` de Android 10+ acepta `-d <displayId>`: el evento
+   * lleva setDisplayId(vd) y llega a la ventana enfocada DEL DISPLAY VIRTUAL
+   * (no a la del teléfono). Si el dispositivo no soporta `-d` (salida con
+   * "Error"/"usage"), devuelve false para que el llamante use el canal de
+   * control de scrcpy.
+   */
+  async inputKeyeventOnDisplay(keycode: number, displayId: number): Promise<boolean> {
+    if (displayId <= 0) {
+      await this.inputKeyevent(keycode);
+      return true;
+    }
+    const out = await this.shellSafe(`input -d ${displayId} keyevent ${keycode}`, 6_000);
+    const bad = /error|usage|invalid|not found|unknown/i.test(out) && !/^\s*$/.test(out);
+    return !bad;
+  }
+
+  /**
+   * v7: mueve una tarea a otro display — el corazón del «minimizar» estilo
+   * Windows. `am move-task <taskId> <displayId>` (Android 10+); si el
+   * dispositivo no lo tiene, prueba `am stack move` (Android 9-11).
+   * Devuelve true si algún comando se aceptó.
+   */
+  async moveTask(taskId: number, displayId: number): Promise<boolean> {
+    const out1 = await this.shellSafe(
+      `am move-task ${taskId} ${displayId} 2>&1`,
+      8_000,
+    );
+    if (!/error|exception|unknown command|not found/i.test(out1)) return true;
+    const out2 = await this.shellSafe(
+      `am stack move ${taskId} ${displayId} 2>&1`,
+      8_000,
+    );
+    return !/error|exception|unknown command|not found/i.test(out2);
+  }
+
+  /**
+   * v7: trae una tarea al frente / la abre en ventana freeform (5) o
+   * pantalla completa (1) sobre un display. `am start` con la tarea
+   * existente la mueve al frente de SU display; `--windowingMode` cambia
+   * el modo de ventana (freeform = ventanas estilo DeX/Windows).
+   */
+  async startActivityOnDisplay(
+    component: string,
+    displayId: number,
+    opts: { windowingMode?: number; newTask?: boolean } = {},
+  ): Promise<boolean> {
+    const flags = opts.newTask === false ? "" : " -f 0x10000000"; // FLAG_ACTIVITY_NEW_TASK
+    const wm =
+      opts.windowingMode != null ? ` --windowingMode ${opts.windowingMode}` : "";
+    const out = await this.shellSafe(
+      `am start --display ${displayId}${flags}${wm} -n ${component} 2>&1`,
+      10_000,
+    );
+    return /Starting:|Warning/i.test(out) && !/Error|Exception/i.test(out);
+  }
+
+  /** Resolución con caché de la activity LAUNCHER de un paquete (fallback). */
+  private launcherActivityCache = new Map<string, string | null>();
+
+  async resolveLauncherActivity(pkg: string): Promise<string | null> {
+    if (this.launcherActivityCache.has(pkg)) {
+      return this.launcherActivityCache.get(pkg) ?? null;
+    }
+    const out = await this.shellSafe(
+      `cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ${pkg} 2>/dev/null | tail -n 1`,
+      8_000,
+    );
+    let target = out.trim();
+    if (!target || !target.includes("/")) {
+      // a veces devuelve "priority=0 preferredOrder=0 match=…" — buscar pkg/
+      const m = out.match(new RegExp(`(${pkg.replace(/[.]/g, "\\.")}/\\S+)`));
+      target = m ? m[1] : "";
+    }
+    const result = target.includes("/") ? target : null;
+    this.launcherActivityCache.set(pkg, result);
+    return result;
+  }
+
   /** `pm list packages` con timeout — el listado de apps nunca bloquea el boot. */
   async listPackages(kind: "user" | "system"): Promise<string> {
     const flag = kind === "user" ? "-3" : "-s";

@@ -46,9 +46,10 @@ import {
 import {
   type BatteryState,
   type MediaSession,
-  type RunningApp,
+  type TaskInfo,
   pollTelemetryBatch,
-  parseRunningApps,
+  TASK_DUMP_COMMAND,
+  parseTasks,
 } from "../utils/telemetry";
 import { parsePackageList, type AppEntry } from "../utils/appNames";
 
@@ -66,6 +67,8 @@ export interface PanelState {
   deviceOpen: boolean;
   settingsOpen: boolean;
   shortcutsOpen: boolean;
+  /** v7: vista «Apps abiertas» (estilo Windows, botón Recientes) */
+  taskViewOpen: boolean;
 }
 
 /**
@@ -180,8 +183,8 @@ interface DexPortState {
   userApps: AppEntry[];
   systemApps: AppEntry[];
   appsLoading: boolean;
-  /** v2: apps visibles en el display virtual (AppMonitor port) */
-  runningApps: RunningApp[];
+  /** v7: tareas abiertas en TODOS los displays (gestión estilo Windows) */
+  runningApps: TaskInfo[];
 
   // ── Panels ──
   panels: PanelState;
@@ -235,6 +238,15 @@ interface DexPortState {
   setVolume: (v: number) => void;
   goHome: () => void;
   sendKeyAction: (keycode: number) => void;
+  /** v7: tecla de navegación DIRIGIDA al display virtual (fix ATRÁS) */
+  sendNavKey: (keycode: number) => Promise<void>;
+  /** v7: HOME instantáneo (keyevent al display) con auto-reparación del launcher */
+  goHomeSmart: () => Promise<void>;
+  /** v7: acciones de ventana estilo Windows sobre una tarea abierta */
+  taskAction: (
+    task: { taskId: number; packageName: string; activity: string | null; displayId: number },
+    action: "front" | "minimize" | "kill" | "freeform" | "fullscreen",
+  ) => Promise<void>;
   reconnectDesktop: () => Promise<void>;
   shutdown: () => Promise<void>;
 }
@@ -342,6 +354,7 @@ export const useStore = create<DexPortState>((set, get) => ({
     deviceOpen: false,
     settingsOpen: false,
     shortcutsOpen: false,
+    taskViewOpen: false,
   },
   toasts: [],
 
@@ -702,6 +715,8 @@ export const useStore = create<DexPortState>((set, get) => ({
         await webAdb.shellSafe(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
       }
       get().togglePanel("drawerOpen", false);
+      // v7: la taskbar muestra la app al momento (sin esperar el tick de 4s)
+      setTimeout(() => void useStore.getState().refreshRunningApps(), 1_200);
     } catch {
       try {
         if (displayName != null && displayName > 0) {
@@ -710,6 +725,7 @@ export const useStore = create<DexPortState>((set, get) => ({
           await webAdb.shellSafe(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
         }
         get().togglePanel("drawerOpen", false);
+        setTimeout(() => void useStore.getState().refreshRunningApps(), 1_200);
       } catch {
         get().toast(`No se pudo lanzar ${pkg}`, "error");
       }
@@ -1176,14 +1192,12 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   refreshRunningApps: async () => {
-    const displayId = get().displayId;
     try {
-      const out = await webAdb.shellSafe(
-        "timeout 3 dumpsys activity activities 2>/dev/null | grep -E '^(Display #)|(Task\\{)' | head -80",
-        10_000,
-      );
-      const running = parseRunningApps(out, displayId && displayId > 0 ? displayId : null);
-      set({ runningApps: running });
+      const out = await webAdb.shellSafe(TASK_DUMP_COMMAND, 12_000);
+      if (!out) return;
+      const [dump, focus] = out.split("__FOCUS__");
+      const tasks = parseTasks(dump ?? "", focus);
+      set({ runningApps: tasks });
     } catch {
       /* noop */
     }
@@ -1200,7 +1214,7 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   goHome: () => {
-    get().launchHome();
+    void get().goHomeSmart();
   },
 
   /**
@@ -1218,6 +1232,150 @@ export const useStore = create<DexPortState>((set, get) => ({
         .catch(() => webAdb.inputKeyevent(keycode));
     } else {
       void webAdb.inputKeyevent(keycode);
+    }
+  },
+
+  /**
+   * v7: tecla de NAVEGACIÓN dirigida al display virtual — fix del
+   * «ATRÁS funciona a medias» y del «Recientes controla el teléfono».
+   *
+   * 1) `input -d <vd> keyevent <code>`: el evento lleva setDisplayId y
+   *    llega a la ventana enfocada del display virtual (fiable, Android 10+)
+   * 2) canal de control scrcpy (el fork también aplica setDisplayId por
+   *    reflexión — falla en silencio en algunos dispositivos)
+   * 3) input keyevent plano (modo espejo)
+   */
+  sendNavKey: async (keycode) => {
+    const vd = get().displayId;
+    if (vd != null && vd > 0) {
+      const ok = await webAdb.inputKeyeventOnDisplay(keycode, vd);
+      if (ok) return;
+    }
+    const controller = displayEngine.controller;
+    if (controller) {
+      try {
+        await controller.injectKeyCode({ action: 0, keyCode: keycode as never, repeat: 0, metaState: 0 as never });
+        await controller.injectKeyCode({ action: 1, keyCode: keycode as never, repeat: 0, metaState: 0 as never });
+        return;
+      } catch {
+        /* caer al input plano */
+      }
+    }
+    await webAdb.inputKeyevent(keycode);
+  },
+
+  /**
+   * v7: HOME instantáneo — keyevent HOME dirigido al display virtual
+   * (el launcher pasa al frente al instante, sin protocolo am start).
+   * Si tras 1.2s el display sigue sin contenido, el launcher murió →
+   * protocolo robusto completo (selectLauncher con verificación).
+   */
+  goHomeSmart: async () => {
+    const vd = get().displayId;
+    if (vd == null || vd <= 0) {
+      get().sendKeyAction(3); // HOME físico (modo espejo)
+      return;
+    }
+    const before = get().runningApps.some((t) => t.displayId === vd);
+    await get().sendNavKey(3);
+    // verificación diferida: si no había NADA en el display (launcher muerto)
+    // o no aparece tras el keyevent → relanzar con el protocolo completo
+    setTimeout(async () => {
+      try {
+        await get().refreshRunningApps();
+        const s = useStore.getState();
+        const vd2 = s.displayId;
+        if (vd2 == null || vd2 <= 0) return;
+        const hasContent = s.runningApps.some((t) => t.displayId === vd2);
+        if (!hasContent || (!before && !hasContent)) {
+          await s.launchHome();
+        }
+      } catch {
+        /* noop */
+      }
+    }, 1_400);
+  },
+
+  /**
+   * v7: acciones de ventana estilo Windows sobre una tarea abierta.
+   *   front      → traer al frente (restore si estaba «minimizada» en el teléfono)
+   *   minimize   → mandar la tarea al display del teléfono (sigue viva,
+   *                desaparece del escritorio — minimize real)
+   *   kill       → am force-stop
+   *   freeform   → reabrir en VENTANA (windowingMode 5, estilo DeX)
+   *   fullscreen → reabrir a PANTALLA COMPLETA (windowingMode 1)
+   */
+  taskAction: async (task, action) => {
+    const s = get();
+    const vd = s.displayId;
+    const label = s.userApps.find((a) => a.packageName === task.packageName)?.label
+      ?? s.systemApps.find((a) => a.packageName === task.packageName)?.label
+      ?? task.packageName;
+
+    const resolveComponent = async (): Promise<string | null> =>
+      task.activity ?? (await webAdb.resolveLauncherActivity(task.packageName));
+
+    try {
+      if (action === "kill") {
+        await webAdb.forceStop(task.packageName);
+        s.toast(`${label} cerrada`, "success");
+      } else if (action === "front") {
+        if (vd == null || vd <= 0) throw new Error("sin display virtual");
+        if (task.displayId !== vd && task.taskId > 0) {
+          // estaba «minimizada» en el teléfono → devolverla al escritorio
+          const moved = await webAdb.moveTask(task.taskId, vd);
+          if (!moved) {
+            const comp = await resolveComponent();
+            if (comp) await webAdb.startActivityOnDisplay(comp, vd);
+          }
+        } else {
+          const comp = await resolveComponent();
+          if (!comp) throw new Error("no se pudo resolver la actividad");
+          const ok = await webAdb.startActivityOnDisplay(comp, vd);
+          if (!ok && task.taskId > 0) await webAdb.moveTask(task.taskId, vd);
+        }
+        s.togglePanel("taskViewOpen", false);
+      } else if (action === "minimize") {
+        if (task.displayId === vd) {
+          // mandarla al display del teléfono (minimize real estilo Windows:
+          // sigue ejecutándose, desaparece del escritorio)
+          let ok = false;
+          if (task.taskId > 0) ok = await webAdb.moveTask(task.taskId, 0);
+          if (!ok) {
+            // fallback: HOME en el display virtual (todo a segundo plano)
+            if (vd != null && vd > 0) await get().sendNavKey(3);
+            else get().sendKeyAction(3);
+          }
+        } else {
+          // ya está en el teléfono — llevarla al fondo (HOME del teléfono)
+          get().sendKeyAction(3);
+        }
+        s.toast(`${label} minimizada`, "info");
+      } else if (action === "freeform" || action === "fullscreen") {
+        if (vd == null || vd <= 0) throw new Error("sin display virtual");
+        const comp = await resolveComponent();
+        if (!comp) throw new Error("no se pudo resolver la actividad");
+        const mode = action === "freeform" ? 5 : 1;
+        const ok = await webAdb.startActivityOnDisplay(comp, vd, {
+          windowingMode: mode,
+        });
+        s.toast(
+          ok
+            ? action === "freeform"
+              ? `${label} en ventana — arrastra la ventana dentro del escritorio`
+              : `${label} a pantalla completa`
+            : `El dispositivo no permitió cambiar el modo de ventana de ${label}`,
+          ok ? "success" : "error",
+        );
+        s.togglePanel("taskViewOpen", false);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      s.toast(`Acción fallida: ${msg.slice(0, 90)}`, "error");
+    } finally {
+      // refresco inmediato — la taskbar se actualiza al momento
+      void get().refreshRunningApps();
+      setTimeout(() => void useStore.getState().refreshRunningApps(), 1_500);
     }
   },
 
@@ -1323,6 +1481,7 @@ export const useStore = create<DexPortState>((set, get) => ({
         deviceOpen: false,
         settingsOpen: false,
         shortcutsOpen: false,
+        taskViewOpen: false,
       },
     });
   },
@@ -1403,7 +1562,8 @@ function startLauncherWatchdog(): void {
       return;
     }
     // aprovechar el último refresco del AppMonitor (corre cada 4s)
-    const hasContent = s.runningApps.length > 0;
+    // v7: runningApps contiene tareas de TODOS los displays — contar el VD
+    const hasContent = s.runningApps.some((t) => t.displayId === s.displayId);
     if (hasContent) {
       watchdogSawContent = true;
       watchdogEmptyStreak = 0;

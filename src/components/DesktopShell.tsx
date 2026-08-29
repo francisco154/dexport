@@ -17,6 +17,7 @@ import { useEffect, useRef, useState } from "react";
 import { DisplayCanvas } from "./DisplayCanvas";
 import { Taskbar } from "./Taskbar";
 import { AppDrawer } from "./AppDrawer";
+import { TaskView } from "./TaskView";
 import { MediaPanel, DevicePanel, SettingsPanel, ShortcutsModal } from "./Panels";
 import { ReconnectOverlay } from "./ReconnectOverlay";
 import { Toasts } from "./Toasts";
@@ -98,6 +99,8 @@ export function DesktopShell() {
         {/* Reloj analógico decorativo (ocultable desde Ajustes) */}
         {phase === "desktop" && showClock && <AnalogClock />}
         <AppDrawer />
+        {/* v7: vista «Apps abiertas» estilo Windows (botón Recientes) */}
+        <TaskView />
         <MediaPanel />
         <DevicePanel />
         <SettingsPanel />
