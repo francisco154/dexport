@@ -28,10 +28,12 @@ import {
 } from "../services/companion";
 import { companionBridge } from "../services/companionBridge";
 import {
-  listHomeLaunchers,
+  scanHomeLaunchers,
   launchLauncherOnDisplay,
   launcherLabel,
+  parsePerPackageHome,
   type LauncherInfo,
+  type LauncherScanReport,
 } from "../services/launcher";
 import { COMPANION_PKG, COMPANION_MAIN_ACTIVITY } from "../services/companion";
 import {
@@ -113,10 +115,12 @@ interface DexPortState {
   companionVersion: string | null;
   companionInstall: InstallProgress;
 
-  // ── v4: selector de launcher principal ──
+  // ── v4/v5: selector de launcher principal ──
   /** launchers HOME instalados en el dispositivo (vía ADB) */
   launchers: LauncherInfo[];
   launchersLoading: boolean;
+  /** v5: informe de diagnóstico del último escaneo (salida cruda por estrategia) */
+  launcherScan: LauncherScanReport[];
   /** pantalla de selección de launcher visible */
   launcherPickerOpen: boolean;
   /** componente elegido y persistido ("com.pkg/.Activity") */
@@ -178,6 +182,8 @@ interface DexPortState {
   /** elige (y lanza con verificación) un launcher; instala el original si falta */
   selectLauncher: (component: string) => Promise<boolean>;
   skipLauncher: () => void;
+  /** v5: añade un launcher manualmente por paquete/componente (si el escaneo falla) */
+  addManualLauncher: (input: string) => Promise<boolean>;
   refreshApps: () => Promise<void>;
   refreshTelemetry: () => Promise<void>;
   refreshRunningApps: () => Promise<void>;
@@ -207,6 +213,11 @@ function saveLauncherPref(component: string | null): void {
   } catch {
     /* noop */
   }
+}
+
+/** v5: fuentes de un launcher sin duplicados ("vía X" en el selector). */
+function dedupeSources(sources: string[]): string[] {
+  return [...new Set(sources)];
 }
 
 function loadSettings(): DisplaySettings {
@@ -264,6 +275,7 @@ export const useStore = create<DexPortState>((set, get) => ({
 
   launchers: [],
   launchersLoading: false,
+  launcherScan: [],
   launcherPickerOpen: false,
   selectedLauncherComponent: null,
   launcherActive: false,
@@ -644,6 +656,7 @@ export const useStore = create<DexPortState>((set, get) => ({
               label: "AndroidDex · Launcher original",
               isDefault: false,
               isCompanion: true,
+              sources: ["proyecto original"],
             },
             displayId,
             { controller: displayEngine.controller ?? null, forceStop: true },
@@ -734,24 +747,30 @@ export const useStore = create<DexPortState>((set, get) => ({
   // v4: SELECTOR DE LAUNCHER PRINCIPAL
   // ═════════════════════════════════════════════════════════
 
-  /** Enumera los launchers HOME del dispositivo vía ADB. */
+  /**
+   * v5: enumera los launchers HOME del dispositivo vía ADB con el
+   * ESCANEO MULTIESTRATEGIA (query-activities + resolve-activity +
+   * shortcut + dumpsys + escaneo difuso por nombre de paquete).
+   * Guarda también el informe de diagnóstico por estrategia para
+   * poder ver en el selector exactamente qué devolvió el teléfono.
+   */
   refreshLaunchers: async () => {
     set({ launchersLoading: true });
     try {
       // estado del launcher original (companion) primero
       await get().checkCompanion().catch(() => false);
-      const infos = await listHomeLaunchers();
+      const { launchers, report } = await scanHomeLaunchers();
       // enriquecer etiquetas con las apps ya conocidas (bridge/íconos v3)
       const known = new Map<string, AppEntry>();
       for (const a of get().userApps) known.set(a.packageName, a);
       for (const a of get().systemApps) known.set(a.packageName, a);
-      for (const l of infos) {
+      for (const l of launchers) {
         if (!l.isCompanion) {
           const app = known.get(l.pkg);
           if (app?.label) l.label = app.label;
         }
       }
-      set({ launchers: infos });
+      set({ launchers, launcherScan: report });
     } catch {
       /* la lista mínima (original + default) se muestra igualmente */
     } finally {
@@ -778,6 +797,61 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
+   * v5: añade manualmente un launcher por paquete o componente
+   * ("com.binary.hyperdroid" o "com.pkg/.HomeActivity"). Lo verifica
+   * por ADB (¿tiene categoría HOME?) y lo añade a la lista del selector.
+   * Escape hatch cuando el escaneo automático no encuentra nada.
+   */
+  addManualLauncher: async (input) => {
+    const raw = input.trim();
+    if (!raw || !/^[a-zA-Z][a-zA-Z0-9_.]*(\/[.a-zA-Z0-9_$]+)?$/.test(raw)) {
+      get().toast("Escribe un nombre de paquete válido (p.ej. com.binary.hyperdroid)", "error");
+      return false;
+    }
+    const pkg = raw.split("/")[0];
+    set({ launchersLoading: true });
+    try {
+      let component = raw.includes("/") ? raw : pkg;
+      if (!raw.includes("/")) {
+        // resolver la activity HOME del paquete
+        const out = await webAdb.shellSafe(
+          `dumpsys package ${pkg} 2>/dev/null | grep -B6 -A1 'android.intent.category.HOME' | head -20`,
+          8_000,
+        );
+        const comp = parsePerPackageHome(out, pkg);
+        if (comp) component = comp;
+      }
+      const installed = await webAdb.shellSafe(`pm list packages ${pkg} 2>/dev/null`, 10_000);
+      if (!installed.includes(`package:${pkg}`)) {
+        get().toast(`El paquete ${pkg} no está instalado en el dispositivo`, "error");
+        return false;
+      }
+      const existing = get().launchers.find((l) => l.pkg === pkg);
+      if (existing) {
+        set({
+          launchers: get().launchers.map((l) =>
+            l.pkg === pkg ? { ...l, component, sources: dedupeSources([...l.sources, "manual"]) } : l,
+          ),
+        });
+      } else {
+        const info: LauncherInfo = {
+          component,
+          pkg,
+          label: launcherLabel(pkg),
+          isDefault: false,
+          isCompanion: pkg === COMPANION_PKG,
+          sources: ["manual"],
+        };
+        set({ launchers: [...get().launchers.filter((l) => !l.isCompanion), info, ...get().launchers.filter((l) => l.isCompanion)] });
+      }
+      get().toast(`${launcherLabel(pkg)} añadido — pulsa «Usar» para lanzarlo`, "success");
+      return true;
+    } finally {
+      set({ launchersLoading: false });
+    }
+  },
+
+  /**
    * v4: ELIGE el launcher principal — instala el original si falta y
    * lo lanza en el display virtual con verificación real.
    * Devuelve true si quedó abierto (verificado) en el escritorio.
@@ -792,6 +866,7 @@ export const useStore = create<DexPortState>((set, get) => ({
         label: launcherLabel(component.split("/")[0]),
         isDefault: false,
         isCompanion: component.split("/")[0] === COMPANION_PKG,
+        sources: ["sintetizado"],
       };
     set({ launcherBusy: true, lastLauncherLog: null, launcherActive: false });
     const log: string[] = [];

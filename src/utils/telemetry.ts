@@ -146,13 +146,16 @@ export function parseMediaSessions(out: string): MediaSession[] {
 }
 
 /**
- * v2: port del AppMonitor del servidor original.
+ * v2/v5: port del AppMonitor del servidor original.
  * `dumpsys activity activities` → apps visibles por display.
  *
- * Formato (Android 10+):
- *   Display #2
- *     ...
- *     * Task{8f2f #4 type=standard A=10285:com.whatsapp U=0 ... visible=true
+ * Formatos tolerados (Android 10 → 15 / Samsung One UI):
+ *   Display #2 (from top to bottom):
+ *     Task{8f2f #4 type=standard A=10285:com.whatsapp U=0 ... visible=true}
+ *     TaskRecord{1a2b #7 A=14:com.shrey.androiddex u0 ...}
+ *   (v4 exigía `visible=true` literal en la misma línea y el formato
+ *    exacto `A=x:pkg U=y` → fallaba en muchos Samsung; v5 captura el
+ *    paquete siempre y trata la visibilidad como secundaria)
  */
 export function parseRunningApps(out: string, onlyDisplayId?: number | null): RunningApp[] {
   if (!out) return [];
@@ -165,11 +168,14 @@ export function parseRunningApps(out: string, onlyDisplayId?: number | null): Ru
       displayId = Number(d[1]);
       continue;
     }
-    const t = line.match(/Task\{[^}]*?A=\d+:([^\s}]+)\s+U=\d+[^}]*?\bvisible=true/);
+    // Task{... A=123:com.pkg ...} o TaskRecord{... A=123:com.pkg ...}
+    const t = line.match(/(?:Task|TaskRecord)\{[^}]*?\bA=(-?\d+):([a-zA-Z][a-zA-Z0-9_.]*)/);
     if (t) {
-      const pkg = t[1];
-      // descartar systemui/launcher del conteo de "apps"
+      const pkg = t[2];
+      // descartar systemui del conteo de "apps"
       if (pkg === "com.android.systemui") continue;
+      // visibilidad secundaria: si la línea declara visible=false explícito → no contar
+      if (/\bvisible=false\b/.test(line)) continue;
       const key = `${displayId}:${pkg}`;
       if (!seen.has(key)) {
         seen.add(key);

@@ -183,7 +183,7 @@ export class CompanionService {
           .map((l) => l.trim())
           .filter((l) => l && !l.startsWith("pkg:"))
           .join(" · ") || "razón desconocida";
-      throw new Error(`pm install falló: ${reason.slice(0, 200)}`);
+      throw new Error(`pm install falló: ${reason.slice(0, 200)}${installHint(reason)}`);
     }
 
     // limpiar el temporal del dispositivo
@@ -243,6 +243,30 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
     offset += c.byteLength;
   }
   return out;
+}
+
+/**
+ * v5: consejo amable para los motivos de fallo más comunes de
+ * `pm install` en Samsung/One UI y otros fabricantes.
+ */
+export function installHint(rawError: string): string {
+  const e = rawError.toLowerCase();
+  if (e.includes("user_restricted") || e.includes("user_restriction")) {
+    return " — activa «Instalar vía USB» en Opciones de desarrollador del teléfono y reintenta";
+  }
+  if (e.includes("verification_timeout") || e.includes("verifier")) {
+    return " — el verificador de apps tardó demasiado: acepta el diálogo del teléfono o desactiva «Verificar apps vía USB»";
+  }
+  if (e.includes("update_incompatible") || e.includes("signatures")) {
+    return " — desinstala primero la versión anterior del launcher (panel Dispositivo → desinstalar) e reintenta";
+  }
+  if (e.includes("insufficient_storage")) {
+    return " — libera espacio en el teléfono (~100 MB) e reintenta";
+  }
+  if (e.includes("cancelled") || e.includes("canceled")) {
+    return " — la instalación se canceló: acepta el diálogo de confirmación del teléfono";
+  }
+  return "";
 }
 
 export const companion = CompanionService.instance;

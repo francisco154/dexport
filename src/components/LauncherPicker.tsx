@@ -30,10 +30,13 @@ import {
   Home,
   Loader2,
   MonitorSmartphone,
+  Plus,
   RefreshCw,
+  Search,
   Smartphone,
   X,
 } from "lucide-react";
+import { useState } from "react";
 import { useStore } from "../store/store";
 import { COMPANION_APK_SIZE } from "../services/companion";
 import type { LauncherInfo } from "../services/launcher";
@@ -155,12 +158,13 @@ function LauncherPickerCard() {
         {loading && others.length === 0 ? (
           <div className="glass flex items-center gap-2.5 rounded-2xl p-3.5 text-[12.5px] text-[#8a93a3]">
             <Loader2 size={14} className="animate-spin" />
-            Leyendo los launchers instalados en el dispositivo (query-activities HOME)…
+            Buscando launchers (query-activities · resolve-activity · shortcut · dumpsys · escaneo difuso)…
           </div>
         ) : others.length === 0 ? (
           <div className="glass rounded-2xl p-3.5 text-[12.5px] text-[#8a93a3]">
-            No se encontraron otros launchers con categoría HOME. Si instalaste
-            uno (p.ej. HyperDroid), pulsa <b>Actualizar</b>.
+            No se encontraron launchers del teléfono con los 6 métodos de búsqueda.
+            Si instalaste uno (p.ej. HyperDroid), pulsa <b>Actualizar</b> — o
+            añádelo a mano por su nombre de paquete abajo.
           </div>
         ) : (
           <div className="flex flex-col gap-2">
@@ -174,6 +178,12 @@ function LauncherPickerCard() {
             ))}
           </div>
         )}
+
+        {/* v5: alta manual por nombre de paquete (escape hatch) */}
+        <ManualAdd />
+
+        {/* v5: diagnóstico del escaneo (salida cruda de cada método) */}
+        <ScanDiagnostics />
       </div>
 
       {/* Pie: continuar sin launcher */}
@@ -323,6 +333,14 @@ function LauncherRow({
               Predeterminado del teléfono
             </span>
           )}
+          {info.sources.length > 0 && (
+            <span
+              className="rounded-full bg-white/5 px-2 py-0.5 text-[9.5px] font-medium tracking-wide text-[#5a606c]"
+              title={`Encontrado vía: ${info.sources.join(", ")}`}
+            >
+              vía {info.sources[info.sources.length - 1]}
+            </span>
+          )}
           {isSelected && (
             <span className="flex items-center gap-1 rounded-full bg-sky-400/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300 ring-1 ring-sky-400/30">
               <BadgeCheck size={10} /> Activo
@@ -347,6 +365,120 @@ function LauncherRow({
         )}
       </button>
     </div>
+  );
+}
+
+/**
+ * v5: alta manual de un launcher por nombre de paquete o componente
+ * (p.ej. «com.binary.hyperdroid»). Escape hatch cuando el escaneo
+ * automático no encuentra nada — el paquete se verifica por ADB.
+ */
+function ManualAdd() {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const addManualLauncher = useStore((s) => s.addManualLauncher);
+
+  const submit = async () => {
+    if (!value.trim() || busy) return;
+    setBusy(true);
+    try {
+      const ok = await addManualLauncher(value);
+      if (ok) setValue("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-2.5 flex items-center gap-2">
+      <div className="glass flex flex-1 items-center gap-2 rounded-2xl px-3 py-2">
+        <Search size={13} className="shrink-0 text-[#5a606c]" />
+        <input
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void submit();
+          }}
+          placeholder="Añadir por paquete… p.ej. com.binary.hyperdroid"
+          className="w-full bg-transparent font-mono text-[11.5px] text-white placeholder:text-[#454c57] focus:outline-none"
+          spellCheck={false}
+        />
+      </div>
+      <button
+        className="btn-outline shrink-0 !py-2 !text-[12px]"
+        disabled={busy || !value.trim()}
+        onClick={() => void submit()}
+        title="Verificar el paquete vía ADB y añadirlo a la lista"
+      >
+        {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+        Añadir
+      </button>
+    </div>
+  );
+}
+
+/**
+ * v5: diagnóstico del ESCANEO de launchers — la salida cruda que
+ * devolvió el teléfono para cada método de búsqueda. Si algo sigue
+ * sin funcionar, este panel muestra exactamente el porqué (se puede
+ * copiar y reportar).
+ */
+function ScanDiagnostics() {
+  const scan = useStore((s) => s.launcherScan);
+  const loading = useStore((s) => s.launchersLoading);
+  const [open, setOpen] = useState(false);
+  if (scan.length === 0 && !loading) return null;
+
+  const total = scan.filter((s) => s.ok && s.strategy !== "S0 · ping del shell").length;
+
+  return (
+    <details
+      className="mt-3 rounded-2xl border border-white/8 bg-black/20"
+      open={open}
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+    >
+      <summary className="flex cursor-pointer select-none items-center gap-1.5 px-3.5 py-2.5 text-[11.5px] font-medium text-[#8a93a3]">
+        <ChevronDown size={12} className={`transition-transform ${open ? "rotate-180" : ""}`} />
+        Diagnóstico de búsqueda ({total}/{scan.length - 1} métodos encontraron launchers)
+      </summary>
+      <div className="max-h-64 space-y-2.5 overflow-y-auto px-3.5 pb-3">
+        {scan.map((s) => (
+          <div key={s.strategy} className="rounded-xl bg-black/30 p-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] font-semibold text-[#aab3bf]">{s.strategy}</p>
+              <span
+                className={`shrink-0 rounded-full px-2 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide ${
+                  s.ok
+                    ? s.strategy.includes("ping")
+                      ? "bg-white/8 text-[#9499a3]"
+                      : "bg-emerald-400/15 text-emerald-300"
+                    : "bg-white/5 text-[#5a606c]"
+                }`}
+              >
+                {s.strategy.includes("ping")
+                  ? s.ok
+                    ? "shell OK"
+                    : "shell ROTO"
+                  : s.ok
+                    ? `${s.found.length} encontrado${s.found.length === 1 ? "" : "s"}`
+                    : "vacío"}
+                {s.ms > 0 ? ` · ${s.ms}ms` : ""}
+              </span>
+            </div>
+            <p className="mt-1 break-all font-mono text-[9.5px] leading-relaxed text-[#5a606c]">
+              $ {s.command}
+            </p>
+            {s.raw ? (
+              <pre className="mt-1.5 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-[#c9d1d9]">
+                {s.raw || "(sin salida)"}
+              </pre>
+            ) : (
+              <p className="mt-1.5 font-mono text-[10px] italic text-[#454c57]">(sin salida)</p>
+            )}
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 

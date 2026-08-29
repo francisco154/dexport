@@ -130,7 +130,7 @@ export function Landing() {
           </p>
           <p className="mt-3 inline-flex items-center gap-2 rounded-full border border-[#3ddc84]/30 bg-[#3ddc84]/10 px-3 py-1 text-[11px] font-medium text-[#3ddc84]">
             <span className="h-1.5 w-1.5 rounded-full bg-[#3ddc84]" />
-            v2 — launcher en el escritorio, apps reales y telemetría estable
+            v5 — shell ADB corregido · búsqueda de launchers x7 métodos · selector con diagnóstico
           </p>
 
           <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">

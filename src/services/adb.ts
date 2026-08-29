@@ -174,30 +174,82 @@ export class WebAdbService {
     this._onDisconnect = callback;
   }
 
-  /** `AdbProvider.run("shell ...")` del original → spawnWaitText vía socket shell. */
+  /**
+   * `AdbProvider.run("shell ...")` del original → spawnWaitText vía socket shell.
+   *
+   * ⚠️ v5 — CORRECCIÓN CRÍTICA del protocolo `exec:`:
+   *   adbd ejecuta `exec:<cadena>` con `sh -c` EN EL DISPOSITIVO, y la
+   *   librería une los argumentos con espacios SIN escaparlos
+   *   (`command.join(" ")`). El código antiguo enviaba
+   *   `["sh", "-c", comando]` → `exec:sh -c cmd package query-activities …`
+   *   → el dispositivo ejecutaba `sh -c "cmd"` (¡solo `cmd`, sin args!)
+   *   → TODOS los comandos con espacios devolvían vacío.
+   *   Por eso no se detectaban launchers ni se abría nada (v1-v4).
+   *
+   *   Ahora se envía el comando COMPLETO como único elemento del array
+   *   (join es identidad) → `exec:<comando>` → `sh -c "<comando>"` ✓.
+   *   Pipes, comillas, `;` y redirecciones los interpreta el sh del dispositivo.
+   */
   async shell(command: string): Promise<string> {
     if (!this._adb) throw new Error("Dispositivo no conectado");
-    return this._adb.subprocess.noneProtocol.spawnWaitText([
-      "sh",
-      "-c",
-      command,
-    ]);
+    return this._adb.subprocess.noneProtocol.spawnWaitText([command]);
   }
 
   /**
-   * v2: `shell()` con timeout del lado del navegador. Un comando colgado
-   * (dumpsys bloqueado, binder muerto en Samsung) ya NO congela el boot.
+   * v5: `shell()` con timeout REAL — además de la carrera, este método
+   * CIERRA el proceso/Socket ADB al vencer el plazo (AbortSignal de la
+   * librería) y conserva la salida parcial recibida hasta entonces.
+   * v1-v4 dejaban el stream abierto para siempre (fugas de sockets que
+   * acababan ahogando la conexión bajo el video de scrcpy).
    */
   async shellTimeout(command: string, timeoutMs = DEFAULT_SHELL_TIMEOUT): Promise<string> {
-    return Promise.race([
-      this.shell(command),
-      new Promise<string>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`timeout (${timeoutMs}ms): ${command.slice(0, 60)}`)),
-          timeoutMs,
+    const adb = this._adb;
+    if (!adb) throw new Error("Dispositivo no conectado");
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      // El AbortSignal viaja dentro de spawn: si createSocket tarda, al
+      // resolverse con la señal ya abortada la librería cierra el socket sola.
+      const proc = await Promise.race([
+        adb.subprocess.noneProtocol.spawn([command], controller.signal),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`timeout (${timeoutMs}ms): ${command.slice(0, 60)}`)),
+            timeoutMs,
+          ),
         ),
-      ),
-    ]);
+      ]);
+
+      // Lectura manual del stream: si el abort corta el socket a mitad,
+      // conservamos los chunks que ya llegaron (lectura parcial).
+      const reader = proc.output.getReader();
+      const chunks: Uint8Array[] = [];
+      const decoder = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) chunks.push(value);
+        }
+      } catch {
+        /* socket cerrado por timeout — nos quedamos con la salida parcial */
+      }
+
+      try {
+        await proc.exited;
+      } catch {
+        /* abortado — ignorar */
+      }
+
+      let text = "";
+      for (const c of chunks) text += decoder.decode(c, { stream: true });
+      text += decoder.decode();
+      return text;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -213,20 +265,19 @@ export class WebAdbService {
   }
 
   /**
-   * v2: ejecuta varios comandos en UN solo stream shell, separados por
-   * marcadores. Reduce los sockets ADB concurrentes (el video scrcpy ocupa
-   * el grueso del ancho de banda WebUSB y ahoga a los streams chicos).
-   * Devuelve un array con la salida de cada comando.
+   * v5: ejecuta varios comandos en UN stream shell, separados por
+   * marcadores. Misma idea que v2 pero SIN el doble wrapper `sh -c`
+   * (que era la causa del bug raíz: ver `shell()`).
+   * El stderr de cada comando se descarta en el dispositivo para que
+   * la salida de marcadores nunca se contamine (noneProtocol mezcla
+   * stdout+stderr en un solo stream).
    */
   async shellBatch(commands: string[], timeoutMs = 15_000): Promise<string[]> {
     const MARK = "__DEXPORT_MARK__";
-    const wrapped = commands
-      .map((c) => `echo ${MARK}${commands.indexOf(c)};${c}`)
+    const script = commands
+      .map((c, i) => `echo ${MARK}${i}; ( ${c} ) 2>/dev/null`)
       .join("\n");
-    const out = await this.shellSafe(
-      `sh -c '${wrapped.replace(/'/g, "'\\''")}' 2>/dev/null`,
-      timeoutMs,
-    );
+    const out = await this.shellSafe(script, timeoutMs);
     const parts: string[] = commands.map(() => "");
     let current = -1;
     let buf = "";
