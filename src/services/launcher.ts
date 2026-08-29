@@ -510,9 +510,37 @@ export interface LaunchOptions {
 }
 
 /**
+ * v6: relanzamiento SILENCIOSO (watchdog) — un solo `am start` sin
+ * force-stop ni cadena de estrategias. Trae la tarea existente al frente
+ * del display virtual (o la recrea si murió). No toca nada más.
+ */
+export async function quietRelaunchOnDisplay(
+  component: string,
+  displayId: number,
+): Promise<boolean> {
+  try {
+    const out = await webAdb.shellSafe(
+      `am start --display ${displayId} -n ${component} 2>&1`,
+      10_000,
+    );
+    return /Starting:|Warning|Status:\s*ok/i.test(out) && !/Error type|Exception/i.test(out);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Protocolo robusto de lanzamiento de un launcher en el display
  * virtual. Devuelve éxito REAL (verificado) + log de diagnóstico
  * completo (cada comando con su salida cruda + crash log si falla).
+ *
+ * ⚠️ v6 — REGLA DE ORO (fix del bug "el launcher se desactiva a los
+ * segundos"): si `am start` responde "Starting:" SIN error, el launcher
+ * SE ESTÁ ABRIENDO y NO se ejecuta ninguna otra estrategia. En v5 la
+ * verificación flaky de Samsung hacía continuar con C/D, y la
+ * estrategia D (intent HOME) desplazaba al launcher recién abierto —
+ * exactamente el síntoma "abre la config y a los segundos se apaga".
+ * Solo se prueba la siguiente estrategia si `am` reportó ERROR real.
  */
 export async function launchLauncherOnDisplay(
   info: LauncherInfo,
@@ -520,7 +548,7 @@ export async function launchLauncherOnDisplay(
   opts: LaunchOptions = {},
 ): Promise<LaunchResult> {
   const log: string[] = [
-    `DexPort v5 · lanzar "${info.label}" (${info.component}) en display #${displayId}`,
+    `DexPort v6 · lanzar "${info.label}" (${info.component}) en display #${displayId}`,
   ];
   const run = async (cmd: string, timeoutMs = 12_000): Promise<string> => {
     const out = await webAdb.shellSafe(cmd, timeoutMs);
@@ -532,6 +560,7 @@ export async function launchLauncherOnDisplay(
     !/Error|Exception|Permission Denial|does not exist|not able to find/i.test(out);
 
   let anyAmOk = false;
+  let sawRealError = false;
 
   // ── 0. si solo tenemos el paquete, resolver su activity HOME ──
   if (!info.component.includes("/")) {
@@ -550,60 +579,79 @@ export async function launchLauncherOnDisplay(
     }
   }
 
-  // ── Estrategia A: force-stop + tarea nueva con clear-task en el display N ──
-  if (opts.forceStop !== false) {
+  // ── Estrategia A: tarea nueva en el display N ──
+  // v6: NUNCA force-stop del companion (mataría su puente 8457 y la
+  // pantalla de configuración que ya está abierta). clear-task basta.
+  const canForceStop = opts.forceStop !== false && !info.isCompanion;
+  if (canForceStop) {
     await run(`am force-stop ${info.pkg}`, 8_000);
-    const outA = await run(
-      `am start --display ${displayId} -n ${info.component} --activity-new-task --activity-clear-task 2>&1`,
-    );
-    if (amSaidOk(outA)) anyAmOk = true;
-    if (amSaidOk(outA)) {
-      if (await verifyOnDisplay(info.pkg, displayId, log)) {
-        return { ok: true, verified: true, strategy: "A", log };
-      }
-    } else {
-      log.push("⚠ estrategia A: am start reportó error (ver arriba)");
-    }
+  } else {
+    log.push(`· sin force-stop (${info.isCompanion ? "companion: se conserva su puente" : "petición"})`);
   }
+  const outA = await run(
+    `am start --display ${displayId} -n ${info.component} --activity-new-task --activity-clear-task 2>&1`,
+  );
+  if (amSaidOk(outA)) {
+    anyAmOk = true;
+    // v6: am dijo que sí → verificar con calma; si la verificación flaquea
+    // (Samsung), aceptar éxito suave y NO seguir con otras estrategias.
+    const verified = await verifyOnDisplay(info.pkg, displayId, log);
+    if (verified) {
+      return { ok: true, verified: true, strategy: "A", log };
+    }
+    log.push(
+      "⚠ am reportó éxito sin verificación (dumpsys del fabricante) — se acepta el lanzamiento tal cual (regla anti-hijack v6)",
+    );
+    return { ok: true, verified: false, strategy: "soft", log };
+  }
+  sawRealError = true;
+  log.push("⚠ estrategia A: am start reportó error (ver arriba)");
 
-  // ── Estrategia C: am start -W (el propio am reporta Status: ok) ──
+  // ── Estrategia C: am start -W (solo si A falló de verdad) ──
   const outC = await run(
     `am start -W --display ${displayId} -n ${info.component} 2>&1`,
     15_000,
   );
-  if (amSaidOk(outC)) anyAmOk = true;
   if (amSaidOk(outC)) {
-    if (await verifyOnDisplay(info.pkg, displayId, log)) {
+    anyAmOk = true;
+    const verified = await verifyOnDisplay(info.pkg, displayId, log);
+    if (verified) {
       return { ok: true, verified: true, strategy: "C", log };
     }
-  }
-
-  // ── Estrategia D: HOME del display N (cualquier launcher del sistema) ──
-  const outD = await run(
-    `am start --display ${displayId} -a ${ACTION_MAIN} -c ${CAT_HOME} 2>&1`,
-  );
-  if (/Starting:|Warning|Status:\s*ok/i.test(outD) && !/Error type|Exception/i.test(outD)) {
-    if (await verifyOnDisplay(null, displayId, log, true)) {
-      return { ok: true, verified: true, strategy: "D", log };
-    }
+    return { ok: true, verified: false, strategy: "soft", log };
   }
 
   // ── Estrategia B: START_APP del canal de control scrcpy ──
-  // (el mismo mensaje que usaba el JAR original — útil para apps;
-  //  para launchers HOME suele ser el último recurso)
-  if (opts.controller) {
+  // (nota: el companion NO tiene activity LAUNCHER habilitada, así que
+  // getLaunchIntentForPackage devuelve null para él — por eso B va
+  // después de A/C y no al revés)
+  if (opts.controller && !info.isCompanion) {
     try {
       log.push(`$ [scrcpy] START_APP ${info.pkg} {forceStop:false}`);
       await opts.controller.startApp(info.pkg, {
         forceStop: false,
         searchByName: false,
       });
-      if (await verifyOnDisplay(info.pkg, displayId, log)) {
+      const verified = await verifyOnDisplay(info.pkg, displayId, log);
+      if (verified) {
         return { ok: true, verified: true, strategy: "B", log };
       }
     } catch (e) {
       log.push(`⚠ START_APP falló: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  // ── Estrategia D: HOME del display N (ÚLTIMO recurso — puede traer
+  // el launcher por defecto del teléfono en lugar del elegido) ──
+  const outD = await run(
+    `am start --display ${displayId} -a ${ACTION_MAIN} -c ${CAT_HOME} 2>&1`,
+  );
+  if (/Starting:|Warning|Status:\s*ok/i.test(outD) && !/Error type|Exception/i.test(outD)) {
+    const verified = await verifyOnDisplay(null, displayId, log, true);
+    if (verified) {
+      return { ok: true, verified: true, strategy: "D", log };
+    }
+    anyAmOk = anyAmOk || /Starting:|Warning/i.test(outD);
   }
 
   // ── diagnóstico del fallo: crash log + presencia del display ──

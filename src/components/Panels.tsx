@@ -358,14 +358,17 @@ export function DevicePanel() {
   );
 }
 
-/** ── Ajustes del display virtual ── */
+/** ── Ajustes del display virtual (v6: pantalla, personalización, calidad) ── */
 export function SettingsPanel() {
   const open = useStore((s) => s.panels.settingsOpen);
   const togglePanel = useStore((s) => s.togglePanel);
   const settings = useStore((s) => s.settings);
   const setSettings = useStore((s) => s.setSettings);
+  const uiPrefs = useStore((s) => s.uiPrefs);
+  const setUiPrefs = useStore((s) => s.setUiPrefs);
   const toast = useStore((s) => s.toast);
   const reconnectDesktop = useStore((s) => s.reconnectDesktop);
+  const resizeDisplayToWindow = useStore((s) => s.resizeDisplayToWindow);
 
   if (!open) return null;
 
@@ -383,10 +386,16 @@ export function SettingsPanel() {
     togglePanel("settingsOpen", false);
   };
 
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else void document.documentElement.requestFullscreen();
+  };
+
   return (
     <PanelShell
+      wide
       title="Ajustes"
-      subtitle="Configuración del display virtual scrcpy (persistente en este navegador)"
+      subtitle="Display virtual, pantalla completa y personalización (persistente en este navegador)"
       onClose={() => togglePanel("settingsOpen", false)}
     >
       <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
@@ -413,10 +422,84 @@ export function SettingsPanel() {
         </button>
       </div>
 
+      {/* ═══════════ v6: PANTALLA COMPLETA Y AJUSTE ═══════════ */}
+      <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
+        Pantalla completa y ajuste
+      </h3>
+      <div className="mb-5 flex flex-col gap-2">
+        <div className="grid grid-cols-2 gap-2">
+          <button className="glass rounded-xl px-4 py-3 text-[13px] font-medium text-[#cfd4dc] transition hover:bg-white/5" onClick={toggleFullscreen}>
+            ⤢ Pantalla completa ahora
+          </button>
+          <button
+            className="glass rounded-xl px-4 py-3 text-[13px] font-medium text-[#cfd4dc] transition hover:bg-white/5"
+            onClick={() => void resizeDisplayToWindow()}
+            title="Redimensiona el display virtual EN VIVO al tamaño actual de la ventana — las apps abiertas no se cierran"
+          >
+            Ajustar display a la ventana
+          </button>
+        </div>
+        <Toggle
+          label="Ajustar a la ventana (sin bandas negras)"
+          hint="El display virtual replica el aspecto de la ventana del navegador — pantalla completa real. Se aplica al reconectar."
+          checked={settings.fitToWindow}
+          onChange={() => void apply({ fitToWindow: !settings.fitToWindow })}
+        />
+        <Toggle
+          label="Auto-ajustar al redimensionar"
+          hint="Al mover la ventana o entrar en pantalla completa, el display se redimensiona en vivo (las apps siguen abiertas)."
+          checked={settings.autoResize}
+          onChange={(v) => setSettings({ autoResize: v })}
+        />
+        <Toggle
+          label="Barra de tareas de Android dentro del escritorio"
+          hint="Desactivada (recomendado): el botón HOME de Android deja el display gris y roba espacio. Usa los botones de DexPort en la barra inferior. Se aplica al reconectar."
+          checked={settings.androidBars}
+          onChange={() => void apply({ androidBars: !settings.androidBars })}
+        />
+        <Toggle
+          label="Mantener el dispositivo despierto"
+          hint="Como el original (wake-lock): la pantalla no se apaga mientras DexPort esté conectado por USB."
+          checked={settings.keepScreenOn}
+          onChange={() => void apply({ keepScreenOn: !settings.keepScreenOn })}
+        />
+        <Toggle
+          label="Ocultar teclado virtual en el escritorio"
+          hint="El teclado en pantalla no aparece en el display DeX — se escribe con el teclado físico del PC. Se aplica al reconectar."
+          checked={settings.hideIme}
+          onChange={() => void apply({ hideIme: !settings.hideIme })}
+        />
+      </div>
+
+      {/* ═══════════ v6: PERSONALIZACIÓN ═══════════ */}
+      <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
+        Personalización
+      </h3>
+      <div className="mb-5 flex flex-col gap-2">
+        <Toggle
+          label="Widget del reloj en el escritorio"
+          hint="El reloj analógico de la esquina superior derecha."
+          checked={uiPrefs.showClock}
+          onChange={(v) => setUiPrefs({ showClock: v })}
+        />
+        <Toggle
+          label="Botones de navegación en la barra"
+          hint="Inicio, atrás, recientes y notificaciones — los botones propios de DexPort."
+          checked={uiPrefs.showTaskbarNav}
+          onChange={(v) => setUiPrefs({ showTaskbarNav: v })}
+        />
+        <Toggle
+          label="Auto-ocultar la barra de tareas"
+          hint="La barra se esconde y aparece al acercar el mouse al borde inferior."
+          checked={uiPrefs.autoHideTaskbar}
+          onChange={(v) => setUiPrefs({ autoHideTaskbar: v })}
+        />
+      </div>
+
       <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         Resolución del display virtual
       </h3>
-      <div className="mb-5 grid grid-cols-2 gap-2">
+      <div className="mb-2 grid grid-cols-2 gap-2">
         {PRESETS.map((p) => (
           <button
             key={`${p.w}x${p.h}`}
@@ -431,6 +514,10 @@ export function SettingsPanel() {
           </button>
         ))}
       </div>
+      <p className="mb-5 text-[11px] leading-relaxed text-[#5a606c]">
+        Con «Ajustar a la ventana» activo, la resolución elegida se usa como lado
+        mayor y el aspecto se adapta a tu ventana (sin bandas negras).
+      </p>
 
       <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         Calidad de video
@@ -488,6 +575,9 @@ export function SettingsPanel() {
             className="h-4 w-4 accent-[#3ddc84]"
           />
         </label>
+        <p className="text-[11px] leading-relaxed text-[#5a606c]">
+          El bitrate y los FPS se aplican al reiniciar el display (botón abajo).
+        </p>
       </div>
 
       <div className="mt-6 flex justify-between gap-2 border-t border-white/8 pt-4">
@@ -509,6 +599,34 @@ export function SettingsPanel() {
         </button>
       </div>
     </PanelShell>
+  );
+}
+
+/** interruptor glass reutilizable (v6) */
+function Toggle({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <label className="glass flex cursor-pointer items-start justify-between gap-3 rounded-xl px-4 py-3">
+      <span className="min-w-0">
+        <span className="block text-[13px] text-[#cfd4dc]">{label}</span>
+        {hint && <span className="mt-0.5 block text-[11px] leading-relaxed text-[#5a606c]">{hint}</span>}
+      </span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-1 h-4 w-4 shrink-0 accent-[#3ddc84]"
+      />
+    </label>
   );
 }
 

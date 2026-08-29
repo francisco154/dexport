@@ -30,6 +30,7 @@ import { companionBridge } from "../services/companionBridge";
 import {
   scanHomeLaunchers,
   launchLauncherOnDisplay,
+  quietRelaunchOnDisplay,
   launcherLabel,
   parsePerPackageHome,
   type LauncherInfo,
@@ -39,6 +40,7 @@ import { COMPANION_PKG, COMPANION_MAIN_ACTIVITY } from "../services/companion";
 import {
   DisplayEngine,
   DEFAULT_DISPLAY_SETTINGS,
+  computeDisplaySizeForContainer,
   type DisplaySettings,
 } from "../services/scrcpy";
 import {
@@ -79,6 +81,41 @@ export type CompanionFlow = "idle" | "checking" | "prompt" | "installing" | "rea
  * "skipped"→ continuar sin launcher
  */
 export type LauncherDecision = "none" | "decided" | "skipped";
+
+/**
+ * v6 — preferencias de la interfaz (instantáneas, sin reiniciar nada).
+ * Port del panel de personalización que pedía el usuario: ocultar el
+ * widget del reloj, botones propios, auto-ocultar la barra…
+ */
+export interface UiPrefs {
+  /** widget del reloj analógico del escritorio */
+  showClock: boolean;
+  /** grupo de navegación propio (inicio/atrás/recientes/notifs) en la taskbar */
+  showTaskbarNav: boolean;
+  /** la taskbar se esconde sola y aparece al acercar el mouse abajo */
+  autoHideTaskbar: boolean;
+}
+
+const UI_PREFS_KEY = "dexport.ui.v2";
+
+function loadUiPrefs(): UiPrefs {
+  const defaults: UiPrefs = { showClock: true, showTaskbarNav: true, autoHideTaskbar: false };
+  try {
+    const raw = localStorage.getItem(UI_PREFS_KEY);
+    if (raw) return { ...defaults, ...JSON.parse(raw) };
+  } catch {
+    /* noop */
+  }
+  return defaults;
+}
+
+function saveUiPrefs(p: UiPrefs): void {
+  try {
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify(p));
+  } catch {
+    /* noop */
+  }
+}
 
 interface DexPortState {
   // ── Fase global ──
@@ -153,12 +190,19 @@ interface DexPortState {
   // ── Settings ──
   settings: DisplaySettings;
 
+  // ── v6: preferencias de la interfaz (instantáneas) ──
+  uiPrefs: UiPrefs;
+
   // ── Acciones ──
   setPhase: (p: Phase) => void;
   setAppBoot: (e: Partial<BootEvent>) => void;
   setEngineBoot: (e: Partial<BootEvent>) => void;
   setBootError: (err: string | null, fatal?: boolean) => void;
   setSettings: (s: Partial<DisplaySettings>) => void;
+  /** v6: preferencias de la interfaz (instantáneas, persistidas) */
+  setUiPrefs: (p: Partial<UiPrefs>) => void;
+  /** v6: redimensiona el display virtual al tamaño actual de la ventana (en vivo) */
+  resizeDisplayToWindow: (silent?: boolean) => Promise<boolean>;
   togglePanel: (k: keyof PanelState, value?: boolean) => void;
   toast: (message: string, kind?: "info" | "error" | "success") => void;
   dismissToast: (id: number) => void;
@@ -302,6 +346,7 @@ export const useStore = create<DexPortState>((set, get) => ({
   toasts: [],
 
   settings: loadSettings(),
+  uiPrefs: loadUiPrefs(),
 
   setPhase: (p) => set({ phase: p }),
   setAppBoot: (e) =>
@@ -313,6 +358,42 @@ export const useStore = create<DexPortState>((set, get) => ({
     const next = { ...get().settings, ...partial };
     saveSettings(next);
     set({ settings: next });
+  },
+
+  setUiPrefs: (partial) => {
+    const next = { ...get().uiPrefs, ...partial };
+    saveUiPrefs(next);
+    set({ uiPrefs: next });
+  },
+
+  /**
+   * v6: ajusta el display virtual al tamaño ACTUAL de la ventana EN VIVO
+   * (mensaje RESIZE_DISPLAY del fork — las apps sobreviven). Es el
+   * «pantalla completa real»: sin bandas negras, aspect idéntico.
+   */
+  resizeDisplayToWindow: async (silent = false) => {
+    const s = get();
+    if (!s.settings.virtualDisplay || s.displayId == null) {
+      if (!silent) s.toast("Sin display virtual activo", "error");
+      return false;
+    }
+    const container = document.querySelector("#dex-display-canvas")?.parentElement;
+    if (!container) return false;
+    const size = computeDisplaySizeForContainer(
+      container.clientWidth,
+      container.clientHeight,
+      Math.max(s.settings.width, s.settings.height),
+    );
+    const changed = await displayEngine.resizeDisplay(size.width, size.height);
+    if (changed) {
+      set({ displaySize: { width: size.width, height: size.height } });
+      if (!silent) {
+        s.toast(`Pantalla ajustada a ${size.width}×${size.height} (en vivo)`, "success");
+      }
+    } else if (!silent) {
+      s.toast("El display ya está ajustado a la ventana", "info");
+    }
+    return changed;
   },
 
   togglePanel: (k, value) =>
@@ -393,6 +474,18 @@ export const useStore = create<DexPortState>((set, get) => ({
           "No se pudieron aplicar los settings DeX — el display virtual funcionará igual",
           "info",
         );
+      }
+
+      // ── v6: mantener el dispositivo DESPIERTO (fix «se desactiva a los
+      // segundos»): el original adquiere un PARTIAL_WAKE_LOCK al arrancar;
+      // el equivalente shell es STAY_ON_WHILE_PLUGGED_IN + wakeup ──
+      try {
+        await applyPowerKeepAwake(get().settings.keepScreenOn);
+        if (get().settings.keepScreenOn) {
+          await webAdb.shellSafe("input keyevent 224", 4_000); // KEYCODE_WAKEUP
+        }
+      } catch {
+        /* noop — scrcpy también aplica stay_awake por su cuenta */
       }
 
       // ── Barra ENGINE (JAR del original): despliegue del motor scrcpy ──
@@ -500,9 +593,13 @@ export const useStore = create<DexPortState>((set, get) => ({
           throw startErr;
         }
       }
-      set({ displaySize: get().settings.virtualDisplay
-        ? { width: get().settings.width, height: get().settings.height }
-        : get().displaySize });
+      // v6: el tamaño real puede diferir de los ajustes (fitToWindow) —
+      // usar el que aplicó el motor; onSizeChanged lo mantendrá al día.
+      set({
+        displaySize: displayEngine.currentSize.width
+          ? { ...displayEngine.currentSize }
+          : { width: get().settings.width, height: get().settings.height },
+      });
 
       // ── 0.84: esperar primer frame (equivale handshake jar.hello) ──
       store.setAppBoot({
@@ -557,6 +654,7 @@ export const useStore = create<DexPortState>((set, get) => ({
       // arrancar loops de fondo
       startTelemetryLoop();
       startAppMonitorLoop();
+      startLauncherWatchdog();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       get().setAppBoot({ message: "Error durante el arranque", isError: true });
@@ -584,6 +682,13 @@ export const useStore = create<DexPortState>((set, get) => ({
   launchApp: async (pkg) => {
     const controller = displayEngine.controller;
     const displayName = get().displayId;
+    // v6: el companion NO tiene activity LAUNCHER (solo HOME), así que
+    // START_APP no puede lanzarlo — usar el protocolo del launcher.
+    if (pkg === COMPANION_PKG) {
+      await get().launchHome();
+      get().togglePanel("drawerOpen", false);
+      return;
+    }
     get().toast(`Lanzando ${pkg}…`, "info");
     try {
       if (controller) {
@@ -1179,6 +1284,8 @@ export const useStore = create<DexPortState>((set, get) => ({
   shutdown: async () => {
     stopTelemetryLoop();
     stopAppMonitorLoop();
+    stopLauncherWatchdog();
+    await restorePowerSetting();
     await displayEngine.stop();
     await webAdb.disconnect();
     set({
@@ -1225,6 +1332,111 @@ export const useStore = create<DexPortState>((set, get) => ({
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ═════════════════════════════════════════════════════════════
+// v6: MANTENER EL DISPOSITIVO DESPIERTO (port del PARTIAL_WAKE_LOCK
+// del JAR original). Guarda el valor actual de STAY_ON_WHILE_PLUGGED_IN,
+// lo pone en 7 (AC|USB|wireless) y lo restaura al desconectar.
+// ═════════════════════════════════════════════════════════════
+let powerOriginalValue: string | null = null;
+let powerApplied = false;
+
+async function applyPowerKeepAwake(enable: boolean): Promise<void> {
+  if (enable) {
+    const current = await webAdb
+      .shellSafe("settings get global stay_on_while_plugged_in", 5_000)
+      .catch(() => "");
+    powerOriginalValue = current.trim() || "0";
+    powerApplied = true;
+    // 7 = AC(1) | USB(2) | WIRELESS(4) — como el original
+    await webAdb.shellSafe("settings put global stay_on_while_plugged_in 7", 5_000);
+  } else {
+    await restorePowerSetting();
+  }
+}
+
+async function restorePowerSetting(): Promise<void> {
+  if (!powerApplied) return;
+  powerApplied = false;
+  const value = powerOriginalValue ?? "0";
+  try {
+    await webAdb.shellSafe(
+      `settings put global stay_on_while_plugged_in ${value}`,
+      5_000,
+    );
+  } catch {
+    /* noop */
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
+// v6: WATCHDOG DEL LAUNCHER (estabilidad del escritorio).
+// Cada 10s: si hay launcher elegido y el display virtual quedó SIN
+// contenido visible 2 veces seguidas (murió / lo cerraron), lo
+// re-lanza SILENCIOSAMENTE (am start sin force-stop) + despierta el
+// dispositivo. Solo actúa si alguna vez se vio contenido en el
+// display (los Samsung que no listan VDs en dumpsys quedan excluidos
+// para evitar bucles de relanzamiento).
+// ═════════════════════════════════════════════════════════════
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+let watchdogEmptyStreak = 0;
+let watchdogSawContent = false;
+let watchdogBusy = false;
+
+function startLauncherWatchdog(): void {
+  stopLauncherWatchdog();
+  watchdogEmptyStreak = 0;
+  watchdogSawContent = false;
+  watchdogTimer = setInterval(async () => {
+    const s = useStore.getState();
+    if (
+      watchdogBusy ||
+      s.phase !== "desktop" ||
+      s.reconnecting ||
+      s.mirrorMode ||
+      s.displayId == null ||
+      s.displayId <= 0 ||
+      s.launcherDecision !== "decided" ||
+      !s.selectedLauncherComponent
+    ) {
+      return;
+    }
+    // aprovechar el último refresco del AppMonitor (corre cada 4s)
+    const hasContent = s.runningApps.length > 0;
+    if (hasContent) {
+      watchdogSawContent = true;
+      watchdogEmptyStreak = 0;
+      return;
+    }
+    if (!watchdogSawContent) return; // el display nunca listó contenido → no intervenir
+    watchdogEmptyStreak++;
+    if (watchdogEmptyStreak < 2) return; // 2 ticks vacíos (~20s) → actuar
+
+    watchdogEmptyStreak = 0;
+    watchdogBusy = true;
+    try {
+      // despertar el dispositivo por si se durmió (keyevent 224 = WAKEUP)
+      await webAdb.shellSafe("input keyevent 224", 4_000).catch(() => "");
+      const ok = await quietRelaunchOnDisplay(
+        s.selectedLauncherComponent,
+        s.displayId,
+      );
+      if (ok) {
+        watchdogSawContent = false; // esperar confirmación del próximo tick
+        useStore.getState().toast("Launcher restaurado automáticamente", "info");
+      }
+    } finally {
+      watchdogBusy = false;
+    }
+  }, 10_000);
+}
+
+function stopLauncherWatchdog(): void {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
 }
 
 function waitFor(

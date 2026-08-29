@@ -1,11 +1,19 @@
 /**
- * DexPort — Desktop shell
+ * DexPort v6 — Desktop shell
  * ════════════════════════════════════════════════════════════
  * Entorno de escritorio DeX: wallpaper, display virtual (canvas),
  * taskbar y paneles. El shell se monta desde el arranque para que
  * el canvas exista cuando el motor scrcpy comience a decodificar.
+ *
+ * v6:
+ *   · widget del reloj OCULTABLE (preferencias del panel Ajustes)
+ *   · ajuste AUTOMÁTICO del display virtual al tamaño de la ventana:
+ *     ResizeObserver + evento fullscreenchange → mensaje RESIZE_DISPLAY
+ *     del fork (las apps sobreviven, solo config-change)
+ *   · taskbar auto-ocultable (aparece al acercar el mouse al borde)
  */
 
+import { useEffect, useRef, useState } from "react";
 import { DisplayCanvas } from "./DisplayCanvas";
 import { Taskbar } from "./Taskbar";
 import { AppDrawer } from "./AppDrawer";
@@ -18,14 +26,77 @@ import { useStore } from "../store/store";
 
 export function DesktopShell() {
   const phase = useStore((s) => s.phase);
+  const showClock = useStore((s) => s.uiPrefs.showClock);
+  const autoHideTaskbar = useStore((s) => s.uiPrefs.autoHideTaskbar);
+  const mainRef = useRef<HTMLElement>(null);
+  const [taskbarVisible, setTaskbarVisible] = useState(true);
+
+  // ── v6: ajuste del display virtual al tamaño de la ventana ──
+  useEffect(() => {
+    const main = mainRef.current;
+    if (!main) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const fit = () => {
+      const s = useStore.getState();
+      if (
+        s.phase !== "desktop" &&
+        s.phase !== "boot"
+      ) {
+        return;
+      }
+      if (
+        !s.settings.autoResize ||
+        !s.settings.fitToWindow ||
+        !s.settings.virtualDisplay ||
+        s.displayId == null ||
+        s.mirrorMode ||
+        s.reconnecting
+      ) {
+        return;
+      }
+      void s.resizeDisplayToWindow(true);
+    };
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(fit, 700); // debounce
+    };
+
+    const ro = new ResizeObserver(schedule);
+    ro.observe(main);
+    window.addEventListener("resize", schedule);
+    document.addEventListener("fullscreenchange", schedule);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", schedule);
+      document.removeEventListener("fullscreenchange", schedule);
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  // ── v6: auto-ocultar la taskbar (hover en el borde inferior) ──
+  useEffect(() => {
+    if (!autoHideTaskbar) {
+      setTaskbarVisible(true);
+      return;
+    }
+    setTaskbarVisible(false);
+    const onMove = (e: MouseEvent) => {
+      const h = window.innerHeight;
+      setTaskbarVisible(e.clientY >= h - 12);
+    };
+    window.addEventListener("mousemove", onMove);
+    return () => window.removeEventListener("mousemove", onMove);
+  }, [autoHideTaskbar]);
 
   return (
     <div className="dex-wallpaper relative flex h-full w-full flex-col overflow-hidden">
       {/* Área del display virtual */}
-      <main className="relative min-h-0 flex-1">
+      <main ref={mainRef} className="relative min-h-0 flex-1">
         <DisplayCanvas focused={phase === "desktop"} />
-        {/* Reloj analógico decorativo (como el widget del original) */}
-        {phase === "desktop" && <AnalogClock />}
+        {/* Reloj analógico decorativo (ocultable desde Ajustes) */}
+        {phase === "desktop" && showClock && <AnalogClock />}
         <AppDrawer />
         <MediaPanel />
         <DevicePanel />
@@ -33,7 +104,9 @@ export function DesktopShell() {
         <ShortcutsModal />
       </main>
 
-      <Taskbar />
+      <div className={taskbarVisible ? "" : "h-0 overflow-hidden"}>
+        <Taskbar />
+      </div>
       <CompanionPromptFloat />
       {/* v4: pantalla de selección de launcher (modal del escritorio) */}
       <LauncherPicker />
@@ -44,7 +117,11 @@ export function DesktopShell() {
 }
 
 function AnalogClock() {
-  const now = new Date();
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
   const seconds = now.getSeconds();
   const minutes = now.getMinutes() + seconds / 60;
   const hours = (now.getHours() % 12) + minutes / 60;

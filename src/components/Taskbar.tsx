@@ -153,6 +153,7 @@ export function Taskbar() {
   const controlOnline = useStore((s) => s.controlOnline);
   const displayId = useStore((s) => s.displayId);
   const runningApps = useStore((s) => s.runningApps);
+  const showTaskbarNav = useStore((s) => s.uiPrefs.showTaskbarNav);
 
   const sendKey = (key: number) => {
     sendKeyAction(key);
@@ -169,7 +170,8 @@ export function Taskbar() {
 
   return (
     <footer className="taskbar relative z-30 flex h-16 select-none items-center gap-2 px-3">
-      {/* ── Navegación (izquierda) ── */}
+      {/* ── Navegación (izquierda) — ocultable desde Ajustes ── */}
+      {showTaskbarNav && (
       <div className="flex items-center gap-1">
         <button
           className="taskbar-btn"
@@ -199,7 +201,7 @@ export function Taskbar() {
         >
           <Info size={18} />
         </button>
-        {/* v2: indicador de estado del canal de control */}
+        {/* indicador de estado del canal de control */}
         <div
           className={`ml-1 h-2 w-2 rounded-full ${controlOnline ? "bg-[#3ddc84]" : "bg-[#f59e0b] pulse-glow"}`}
           title={
@@ -209,6 +211,7 @@ export function Taskbar() {
           }
         />
       </div>
+      )}
 
       <div className="mx-1 h-8 w-px bg-white/10" />
 
