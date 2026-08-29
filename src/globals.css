@@ -168,6 +168,29 @@ body {
   background: rgba(255, 255, 255, 0.09);
   border-color: rgba(255, 255, 255, 0.3);
 }
+.btn-outline:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: 100px;
+  background: transparent;
+  color: #9499a3;
+  font-weight: 500;
+  font-size: 13px;
+  padding: 8px 14px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.btn-ghost:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.07);
+}
 
 /* ── Taskbar (ported from original DeX taskbar) ── */
 .taskbar {

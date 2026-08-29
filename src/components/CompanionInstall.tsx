@@ -134,12 +134,13 @@ export function CompanionInstallCard({ compact = false }: { compact?: boolean })
 }
 
 /**
- * Aviso flotante en el escritorio cuando el launcher original aún no está
- * instalado (aparece si el boot terminó antes de que el usuario decidiera).
+ * Aviso flotante en el escritorio SOLO mientras dura la instalación del
+ * launcher original (v4: la invitación a elegir launcher vive en el
+ * LauncherPicker; aquí queda el feedback de progreso de la instalación).
  */
 export function CompanionPromptFloat() {
   const flow = useStore((s) => s.companionFlow);
-  if (flow !== "prompt" && flow !== "installing") return null;
+  if (flow !== "installing") return null;
   return (
     <div className="absolute bottom-4 right-4 z-30 w-[420px] max-w-[calc(100vw-2rem)]">
       <div className="glass-dark fade-in rounded-2xl p-1.5 shadow-2xl">

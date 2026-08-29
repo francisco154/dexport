@@ -10,7 +10,7 @@
 import { useEffect, useRef } from "react";
 import { AlertTriangle, RefreshCw, MonitorSmartphone, Usb, ShieldCheck } from "lucide-react";
 import { useStore } from "../store/store";
-import { CompanionInstallCard } from "./CompanionInstall";
+import { LauncherPicker } from "./LauncherPicker";
 
 function ProgressBar({
   label,
@@ -51,6 +51,7 @@ export function BootScreen() {
   const retryBoot = useStore((s) => s.retryBoot);
   const shutdown = useStore((s) => s.shutdown);
   const startBoot = useStore((s) => s.startBoot);
+  const pickerOpen = useStore((s) => s.launcherPickerOpen);
   const startedRef = useRef(false);
 
   // Arranque automático al montarse (el canvas ya está en el DOM)
@@ -99,9 +100,6 @@ export function BootScreen() {
           />
         </div>
 
-        {/* v3: instalación del launcher original (companion APK) */}
-        <CompanionInstallCard />
-
         {/* Panel de error (como el original: aparece bajo las barras) */}
         {bootError && (
           <div className="mt-6 rounded-2xl border border-red-500/25 bg-red-500/10 p-4">
@@ -125,7 +123,7 @@ export function BootScreen() {
         )}
 
         {/* Consejos de conexión */}
-        {!bootError && (
+        {!bootError && !pickerOpen && (
           <div className="mt-7 flex flex-col gap-2.5 border-t border-white/8 pt-5 text-[12px] text-[#5a606c]">
             <div className="flex items-center gap-2">
               <Usb size={13} /> Conecta el teléfono por USB con la <b className="text-[#9499a3]">depuración USB</b> activada
@@ -136,6 +134,10 @@ export function BootScreen() {
           </div>
         )}
       </div>
+
+      {/* v4: PANTALLA DE SELECCIÓN DE LAUNCHER (original recomendado +
+          launchers del teléfono) — overlay sobre el boot (z-40) */}
+      <LauncherPicker />
     </div>
   );
 }

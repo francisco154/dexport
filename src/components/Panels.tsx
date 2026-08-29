@@ -32,6 +32,8 @@ import {
   Power,
   Trash2,
   Grid2x2,
+  LayoutGrid,
+  ChevronDown,
 } from "lucide-react";
 import { useStore } from "../store/store";
 import { QUICK_KEYS } from "../utils/androidKeys";
@@ -180,6 +182,11 @@ export function DevicePanel() {
   const launcherPkg = useStore((s) => s.launcherPkg);
   const runningApps = useStore((s) => s.runningApps);
   const launchHome = useStore((s) => s.launchHome);
+  const openLauncherPicker = useStore((s) => s.openLauncherPicker);
+  const launchers = useStore((s) => s.launchers);
+  const selectedLauncherComponent = useStore((s) => s.selectedLauncherComponent);
+  const launcherActive = useStore((s) => s.launcherActive);
+  const lastLauncherLog = useStore((s) => s.lastLauncherLog);
   const [flags, setFlags] = useState<DeviceFlags | null>(null);
 
   useEffect(() => {
@@ -228,8 +235,13 @@ export function DevicePanel() {
         />
         <Stat
           icon={<Smartphone size={18} />}
-          label="Launcher"
-          value={launcherPkg ?? "—"}
+          label="Launcher del escritorio"
+          value={
+            selectedLauncherComponent
+              ? launchers.find((l) => l.component === selectedLauncherComponent)?.label ??
+                selectedLauncherComponent.split("/")[0]
+              : launcherPkg ?? "—"
+          }
         />
         <Stat
           icon={<Grid2x2 size={18} />}
@@ -268,14 +280,28 @@ export function DevicePanel() {
         />
       </div>
 
-      <div className="mt-4">
+      <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
         <button
           className="btn-primary w-full"
           onClick={() => void launchHome()}
         >
           Relanzar launcher en el escritorio
         </button>
+        <button
+          className="btn-outline w-full"
+          onClick={openLauncherPicker}
+        >
+          <LayoutGrid size={14} /> Elegir launcher…
+        </button>
       </div>
+      {selectedLauncherComponent && (
+        <p className="mt-2 flex items-center gap-1.5 text-[11.5px] text-[#5a606c]">
+          <ChevronDown size={11} />
+          {launcherActive
+            ? "Estado: abierto y verificado en el display virtual"
+            : "Estado: sin verificar — pulsa «Relanzar» o elige otro en el selector"}
+        </p>
+      )}
 
       {/* v3: launcher ORIGINAL de Android DEX (companion APK) */}
       <div className="glass mt-3 rounded-2xl p-3.5">
@@ -285,6 +311,23 @@ export function DevicePanel() {
         <CompanionStatusChip />
         <CompanionInstallCard compact />
       </div>
+
+      {/* v4: diagnóstico del launcher — salida cruda del último intento */}
+      {lastLauncherLog && (
+        <div className="glass mt-3 rounded-2xl p-3.5">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-[#5a606c]">
+            Diagnóstico del launcher (último intento)
+          </p>
+          <details>
+            <summary className="cursor-pointer select-none text-[12px] text-[#8a93a3]">
+              Ver detalles técnicos (salida real de ADB)
+            </summary>
+            <pre className="mt-2 max-h-48 overflow-auto rounded-xl bg-black/40 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-[#c9d1d9]">
+              {lastLauncherLog}
+            </pre>
+          </details>
+        </div>
+      )}
 
       <h3 className="mb-3 mt-6 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         Conectividad (polling vía settings)

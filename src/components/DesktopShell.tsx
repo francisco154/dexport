@@ -13,6 +13,7 @@ import { MediaPanel, DevicePanel, SettingsPanel, ShortcutsModal } from "./Panels
 import { ReconnectOverlay } from "./ReconnectOverlay";
 import { Toasts } from "./Toasts";
 import { CompanionPromptFloat } from "./CompanionInstall";
+import { LauncherPicker } from "./LauncherPicker";
 import { useStore } from "../store/store";
 
 export function DesktopShell() {
@@ -34,6 +35,8 @@ export function DesktopShell() {
 
       <Taskbar />
       <CompanionPromptFloat />
+      {/* v4: pantalla de selección de launcher (modal del escritorio) */}
+      <LauncherPicker />
       <ReconnectOverlay />
       <Toasts />
     </div>

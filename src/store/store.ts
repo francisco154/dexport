@@ -28,6 +28,13 @@ import {
 } from "../services/companion";
 import { companionBridge } from "../services/companionBridge";
 import {
+  listHomeLaunchers,
+  launchLauncherOnDisplay,
+  launcherLabel,
+  type LauncherInfo,
+} from "../services/launcher";
+import { COMPANION_PKG, COMPANION_MAIN_ACTIVITY } from "../services/companion";
+import {
   DisplayEngine,
   DEFAULT_DISPLAY_SETTINGS,
   type DisplaySettings,
@@ -63,6 +70,14 @@ export interface PanelState {
  */
 export type CompanionFlow = "idle" | "checking" | "prompt" | "installing" | "ready" | "skipped";
 
+/**
+ * v4 — decisión del selector de launcher (el boot espera esta decisión).
+ * "none"   → el usuario aún no eligió (picker visible)
+ * "decided"→ hay launcher elegido y lanzado
+ * "skipped"→ continuar sin launcher
+ */
+export type LauncherDecision = "none" | "decided" | "skipped";
+
 interface DexPortState {
   // ── Fase global ──
   phase: Phase;
@@ -97,6 +112,23 @@ interface DexPortState {
   companionInstalled: boolean;
   companionVersion: string | null;
   companionInstall: InstallProgress;
+
+  // ── v4: selector de launcher principal ──
+  /** launchers HOME instalados en el dispositivo (vía ADB) */
+  launchers: LauncherInfo[];
+  launchersLoading: boolean;
+  /** pantalla de selección de launcher visible */
+  launcherPickerOpen: boolean;
+  /** componente elegido y persistido ("com.pkg/.Activity") */
+  selectedLauncherComponent: string | null;
+  /** último lanzamiento verificado en el display virtual */
+  launcherActive: boolean;
+  /** operación en curso (instalar/lanzar/verificar) */
+  launcherBusy: boolean;
+  /** log de diagnóstico del último intento (salidas crudas de am/pm) */
+  lastLauncherLog: string | null;
+  /** decisión del selector — el boot espera aquí (93%) */
+  launcherDecision: LauncherDecision;
 
   // ── Telemetría (AndroidCore port) ──
   battery: BatteryState | null;
@@ -139,6 +171,13 @@ interface DexPortState {
   installCompanion: (autoLaunch?: boolean) => Promise<void>;
   skipCompanion: () => void;
   launchCompanionHome: () => Promise<boolean>;
+  /** v4: selector de launcher principal */
+  refreshLaunchers: () => Promise<void>;
+  openLauncherPicker: () => void;
+  closeLauncherPicker: () => void;
+  /** elige (y lanza con verificación) un launcher; instala el original si falta */
+  selectLauncher: (component: string) => Promise<boolean>;
+  skipLauncher: () => void;
   refreshApps: () => Promise<void>;
   refreshTelemetry: () => Promise<void>;
   refreshRunningApps: () => Promise<void>;
@@ -151,6 +190,24 @@ interface DexPortState {
 }
 
 const SETTINGS_KEY = "dexport.settings.v1";
+const LAUNCHER_KEY = "dexport.launcher.v1";
+
+function loadLauncherPref(): string | null {
+  try {
+    return localStorage.getItem(LAUNCHER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveLauncherPref(component: string | null): void {
+  try {
+    if (component) localStorage.setItem(LAUNCHER_KEY, component);
+    else localStorage.removeItem(LAUNCHER_KEY);
+  } catch {
+    /* noop */
+  }
+}
 
 function loadSettings(): DisplaySettings {
   try {
@@ -204,6 +261,15 @@ export const useStore = create<DexPortState>((set, get) => ({
   companionInstalled: false,
   companionVersion: null,
   companionInstall: { phase: "idle", progress: 0, message: "" },
+
+  launchers: [],
+  launchersLoading: false,
+  launcherPickerOpen: false,
+  selectedLauncherComponent: null,
+  launcherActive: false,
+  launcherBusy: false,
+  lastLauncherLog: null,
+  launcherDecision: "none",
 
   battery: null,
   mediaSessions: [],
@@ -436,33 +502,31 @@ export const useStore = create<DexPortState>((set, get) => ({
         20_000,
       );
 
-      // ── 0.93→1.00: launcher original + apps EN BACKGROUND ──
+      // ── 0.93→1.00: selector de launcher + apps EN BACKGROUND ──
       store.setAppBoot({
         message: "Preparando escritorio…",
         progress: 0.93,
       });
 
-      // v3: si el LAUNCHER ORIGINAL está por instalarse (companion APK del
-      // release oficial), esperamos la decisión del usuario — la tarjeta de
-      // instalación con progreso está visible en este mismo boot screen,
-      // igual que el instalador del companion del original.
-      await waitFor(
-        () => {
-          const f = get().companionFlow;
-          return f === "ready" || f === "skipped" || f === "prompt" || f === "installing";
-        },
-        18_000,
-      );
-      const cf = get().companionFlow;
-      if (cf === "prompt" || cf === "installing") {
-        // decisión/instalación en curso — esperar (máx. 10 min de cortesía)
+      // v4: esperar la decisión del selector de launcher (pantalla de
+      // selección: original recomendado + launchers del teléfono).
+      // Solo aplica con display virtual; si el selector no llega a abrirse
+      // (error de shell), el boot continúa tras la ventana de gracia.
+      if (!get().mirrorMode) {
         await waitFor(
-          () => {
-            const f = get().companionFlow;
-            return f === "ready" || f === "skipped";
-          },
-          600_000,
+          () =>
+            get().launcherDecision !== "none" ||
+            get().launcherPickerOpen ||
+            get().mirrorMode,
+          25_000,
         );
+        if (get().launcherPickerOpen && get().launcherDecision === "none") {
+          // selector visible e interactivo — esperar la elección del usuario
+          await waitFor(
+            () => get().launcherDecision !== "none",
+            600_000,
+          );
+        }
       }
 
       // NO se espera: el boot completa y la sync sigue de fondo
@@ -554,7 +618,6 @@ export const useStore = create<DexPortState>((set, get) => ({
       // el estado de flujo lo decide quien llama (prompt/ready/skipped)
     }
   },
-
   installCompanion: async (autoLaunch = true) => {
     if (get().companionFlow === "installing") return;
     set({
@@ -573,9 +636,34 @@ export const useStore = create<DexPortState>((set, get) => ({
         const displayId = get().displayId;
         if (displayId != null && displayId > 0) {
           set({ companionInstall: { phase: "launching", progress: 0.5, message: "Abriendo el launcher en el display virtual…" } });
-          const ok = await companion.launchOnDisplay(displayId);
-          set({ companionInstall: { phase: "done", progress: 1, message: ok ? "Launcher abierto ✓" : "Instalado — pulsa HOME para abrirlo" } });
-          if (ok) get().toast("Launcher AndroidDex abierto en el escritorio ✓", "success");
+          // v4: protocolo robusto con verificación + log de diagnóstico
+          const result = await launchLauncherOnDisplay(
+            {
+              component: COMPANION_MAIN_ACTIVITY,
+              pkg: COMPANION_PKG,
+              label: "AndroidDex · Launcher original",
+              isDefault: false,
+              isCompanion: true,
+            },
+            displayId,
+            { controller: displayEngine.controller ?? null, forceStop: true },
+          );
+          const ok = result.ok;
+          set({
+            companionInstall: { phase: "done", progress: 1, message: ok ? "Launcher abierto ✓" : "Instalado — elige el launcher en el selector" },
+            lastLauncherLog: result.log.join("\n---\n").slice(0, 6_000),
+            launcherActive: ok,
+            ...(ok
+              ? {
+                  selectedLauncherComponent: COMPANION_MAIN_ACTIVITY,
+                  launcherDecision: "decided" as const,
+                }
+              : {}),
+          });
+          if (ok) {
+            saveLauncherPref(COMPANION_MAIN_ACTIVITY);
+            get().toast("Launcher AndroidDex abierto en el escritorio ✓", "success");
+          }
         } else {
           set({ companionInstall: { phase: "done", progress: 1, message: "Instalado ✓" } });
         }
@@ -588,6 +676,8 @@ export const useStore = create<DexPortState>((set, get) => ({
         companionInstall: { phase: "error", progress: 0, message: "", error: msg },
       });
       get().toast(`Instalación fallida: ${msg.slice(0, 120)}`, "error");
+      // v4: re-lanzar para que el selector de launcher registre el error
+      throw e instanceof Error ? e : new Error(msg);
     }
   },
 
@@ -602,85 +692,208 @@ export const useStore = create<DexPortState>((set, get) => ({
       get().toast("Sin display virtual activo", "error");
       return false;
     }
-    const ok = await companion.launchOnDisplay(displayId);
-    if (!ok) get().toast("No se pudo abrir el launcher AndroidDex", "error");
-    return ok;
+    // v4: delega en el protocolo robusto (verificación + log)
+    return get().selectLauncher(COMPANION_MAIN_ACTIVITY);
   },
 
+  /**
+   * v4: HOME del escritorio — lanza el launcher SELECCIONADO con el
+   * protocolo robusto (verificación en el display virtual). Si falla,
+   * abre el selector para elegir otro (p.ej. HyperDroid).
+   */
   launchHome: async () => {
     const displayId = get().displayId;
-    // v3: el launcher ORIGINAL (companion) tiene prioridad — es el mismo
-    // comportamiento del escritorio original (HOME = MainActivity del APK)
-    if (get().companionInstalled && displayId != null && displayId > 0) {
-      const ok = await companion.launchOnDisplay(displayId);
-      if (ok) return;
-    }
-    if (displayId != null && displayId > 0) {
-      // fallback: launcher del teléfono en el display virtual
-      const ok = await webAdb.launchHomeOnDisplay(displayId);
-      if (ok) return;
-      // último recurso: HOME del launcher detectado por componente explícito
-      const launcher = get().launcherPkg;
-      if (launcher) {
-        const launched = await webAdb.launchOnDisplay(launcher, displayId);
-        if (launched) return;
-      }
-      get().toast("No se pudo abrir el launcher — usa el botón del panel Dispositivo", "error");
-    } else {
+    if (displayId == null || displayId <= 0) {
+      // modo espejo o sin display virtual → HOME físico del teléfono
       get().sendKeyAction(3); // KEYCODE_HOME
+      return;
+    }
+
+    const selected =
+      get().selectedLauncherComponent ??
+      // sin elección previa: el original si está instalado
+      (get().companionInstalled ? COMPANION_MAIN_ACTIVITY : null);
+
+    if (selected) {
+      const ok = await get().selectLauncher(selected);
+      if (ok) return;
+    } else {
+      // sin selección posible → intentar el protocolo genérico HOME
+      const anyLauncher = get().launchers[0];
+      if (anyLauncher) {
+        const ok = await get().selectLauncher(anyLauncher.component);
+        if (ok) return;
+      }
+    }
+
+    get().toast("No se pudo abrir el launcher — elige uno en el selector", "error");
+    set({ launcherPickerOpen: true });
+  },
+
+  // ═════════════════════════════════════════════════════════
+  // v4: SELECTOR DE LAUNCHER PRINCIPAL
+  // ═════════════════════════════════════════════════════════
+
+  /** Enumera los launchers HOME del dispositivo vía ADB. */
+  refreshLaunchers: async () => {
+    set({ launchersLoading: true });
+    try {
+      // estado del launcher original (companion) primero
+      await get().checkCompanion().catch(() => false);
+      const infos = await listHomeLaunchers();
+      // enriquecer etiquetas con las apps ya conocidas (bridge/íconos v3)
+      const known = new Map<string, AppEntry>();
+      for (const a of get().userApps) known.set(a.packageName, a);
+      for (const a of get().systemApps) known.set(a.packageName, a);
+      for (const l of infos) {
+        if (!l.isCompanion) {
+          const app = known.get(l.pkg);
+          if (app?.label) l.label = app.label;
+        }
+      }
+      set({ launchers: infos });
+    } catch {
+      /* la lista mínima (original + default) se muestra igualmente */
+    } finally {
+      set({ launchersLoading: false });
+    }
+  },
+
+  openLauncherPicker: () => {
+    set({ launcherPickerOpen: true });
+    void get().refreshLaunchers();
+  },
+
+  closeLauncherPicker: () => {
+    // cerrar sin elegir durante el boot = continuar sin launcher
+    if (get().launcherDecision === "none") {
+      set({ launcherDecision: "skipped" });
+    }
+    set({ launcherPickerOpen: false });
+  },
+
+  skipLauncher: () => {
+    set({ launcherDecision: "skipped", launcherPickerOpen: false });
+    get().toast("Continuando sin launcher — las apps se abren desde el drawer", "info");
+  },
+
+  /**
+   * v4: ELIGE el launcher principal — instala el original si falta y
+   * lo lanza en el display virtual con verificación real.
+   * Devuelve true si quedó abierto (verificado) en el escritorio.
+   */
+  selectLauncher: async (component) => {
+    if (get().launcherBusy) return false;
+    // si la enumeración falló, sintetizar la info mínima del componente
+    const info: LauncherInfo =
+      get().launchers.find((l) => l.component === component) ?? {
+        component,
+        pkg: component.split("/")[0],
+        label: launcherLabel(component.split("/")[0]),
+        isDefault: false,
+        isCompanion: component.split("/")[0] === COMPANION_PKG,
+      };
+    set({ launcherBusy: true, lastLauncherLog: null, launcherActive: false });
+    const log: string[] = [];
+    try {
+      // ── 1. si es el ORIGINAL y no está instalado → instalarlo primero ──
+      if (info.isCompanion && !get().companionInstalled) {
+        await get().installCompanion(false); // lanza excepción si falla
+        log.push(`✓ launcher original instalado (${COMPANION_PKG})`);
+      }
+
+      const displayId = get().displayId;
+      if (displayId == null || displayId <= 0) {
+        throw new Error(
+          "No hay display virtual activo (modo espejo) — reconecta con display virtual",
+        );
+      }
+
+      // ── 2. protocolo robusto: A(force-stop+clear-task) B(START_APP) C D ──
+      const result = await launchLauncherOnDisplay(info, displayId, {
+        controller: displayEngine.controller ?? null,
+        forceStop: true,
+      });
+      log.push(...result.log);
+
+      if (result.ok) {
+        // arrancar el puente del companion si es el original (como el
+        // escritorio original: el companion provee apps con íconos/batería)
+        if (info.isCompanion) void companion.startBridge();
+        saveLauncherPref(component);
+        set({
+          selectedLauncherComponent: component,
+          launcherActive: true,
+          launcherDecision: "decided",
+          lastLauncherLog: log.join("\n---\n").slice(0, 6_000),
+          launcherPickerOpen: false,
+        });
+        get().toast(
+          `${info.label} abierto en el escritorio${result.verified ? " ✓" : ""}`,
+          "success",
+        );
+        void get().refreshRunningApps();
+        return true;
+      }
+
+      // ── 3. fallo: mantener el selector abierto con el diagnóstico ──
+      set({
+        lastLauncherLog: log.join("\n---\n").slice(0, 6_000),
+        launcherPickerOpen: true,
+      });
+      get().toast(
+        "No se pudo abrir el launcher — revisa los detalles y prueba otro",
+        "error",
+      );
+      return false;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log.push(`✗ error: ${msg}`);
+      set({
+        lastLauncherLog: log.join("\n---\n").slice(0, 6_000),
+        launcherPickerOpen: true,
+      });
+      get().toast(`Launcher falló: ${msg.slice(0, 140)}`, "error");
+      return false;
+    } finally {
+      set({ launcherBusy: false });
     }
   },
 
   /**
-   * v2: port del flujo del original al crear el display virtual:
-   * 1) detecta el launcher por defecto
-   * 2) lanza el HOME en el display virtual → wallpaper + app grid
+   * v2/v4: port del flujo del original al crear el display virtual:
+   * 1) enumera launchers del dispositivo (query-activities HOME)
+   * 2) aplica la elección persistida, o abre la PANTALLA DE SELECCIÓN
+   *    (original recomendado + launchers del teléfono, p.ej. HyperDroid)
    * 3) sincroniza las apps visibles (AppMonitor)
    */
   initDesktopAfterDisplay: async (displayId: number) => {
     const s = get();
     if (s.phase !== "boot" && s.phase !== "desktop") return;
     try {
-      // 1) launcher por defecto del teléfono (fallback)
+      // 1) launcher por defecto del teléfono (info del panel)
       const launcher = await webAdb.getDefaultLauncher();
       set({ launcherPkg: launcher });
 
-      // 2) v3: ¿está instalado el LAUNCHER ORIGINAL (companion)?
-      const installed = await s.checkCompanion();
-      if (installed) {
-        // puente del companion arriba (como el original al conectar)
-        void companion.startBridge();
-        const ok = await companion.launchOnDisplay(displayId);
-        set({ companionFlow: "ready" });
-        if (ok) {
-          get().toast(
-            "Launcher AndroidDex (original) abierto en el escritorio ✓",
-            "success",
-          );
-          void get().refreshRunningApps();
-          return;
-        }
-      } else {
-        // no instalado → pedir confirmación al usuario (44 MB)
-        set({ companionFlow: "prompt" });
-        get().toast(
-          "Launcher original de Android DEX no instalado — instálalo para el escritorio completo",
-          "info",
-        );
+      // 2) estado del launcher original + enumeración de launchers
+      await get().refreshLaunchers();
+
+      // 3) ¿elección persistida? → aplicarla automáticamente
+      const pref = loadLauncherPref();
+      if (pref) {
+        // el flujo de selección decide y cierra solo si funciona;
+        // si falla, abre el selector con el error a la vista
+        await get().selectLauncher(pref);
+        void get().refreshRunningApps();
+        return;
       }
 
-      // 3) fallback: HOME del teléfono en el display virtual
-      const ok = await webAdb.launchHomeOnDisplay(displayId);
-      if (ok) {
-        get().toast(
-          launcher
-            ? `Launcher del teléfono (${launcher}) abierto en el display #${displayId}`
-            : "Launcher del teléfono abierto en el display virtual",
-          "success",
-        );
-      }
-
-      // 4) refrescar apps visibles
+      // 4) sin elección → PANTALLA DE SELECCIÓN de launcher principal
+      set({ launcherPickerOpen: true });
+      get().toast(
+        "Elige el launcher del escritorio — original (recomendado) o el de tu teléfono",
+        "info",
+      );
       void get().refreshRunningApps();
     } catch {
       /* el display ya funciona — el launcher es un extra */
@@ -914,6 +1127,14 @@ export const useStore = create<DexPortState>((set, get) => ({
       companionInstalled: false,
       companionVersion: null,
       companionInstall: { phase: "idle", progress: 0, message: "" },
+      launchers: [],
+      launchersLoading: false,
+      launcherPickerOpen: false,
+      selectedLauncherComponent: null,
+      launcherActive: false,
+      launcherBusy: false,
+      lastLauncherLog: null,
+      launcherDecision: "none",
       panels: {
         drawerOpen: false,
         mediaOpen: false,
