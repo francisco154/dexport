@@ -9,6 +9,14 @@ teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
 > 🔗 **Demo en vivo:** <https://dexport-app.vercel.app>
 
+> 🚀 **v3** — **Launcher original incluido**: el APK companion del proyecto
+> original (`com.shrey.androiddex` v1.2, extraído del release oficial por
+> ingeniería inversa) se sirve byte-idéntico y se **instala por WebADB con un
+> clic** al conectar el teléfono (fetch → `adb.sync` push → `pm install -r`).
+> Aporta el escritorio HOME en el display virtual, fondos DeX y el análisis
+> de apps con nombres e íconos reales a través del puente local del companion
+> (puerto 8457, mismo canal que usaba el JAR original).
+
 > 🚀 **v2** — rebuild con ingeniería inversa del build original (AndroidDex v1.2):
 > launcher del teléfono en el escritorio virtual, lanzamiento de apps reales
 > (`am start --display` / START_APP de scrcpy 3.3), boot no bloqueante,
@@ -33,6 +41,24 @@ comandos:
 | Audio por WebSocket (APK companion)          | Audio opus de scrcpy → `AudioDecoder` → `AudioWorklet`         |
 | Logic Engine JAR (`app_process`)             | Comandos shell reenviados (`settings put`, `pm list`, `am …`)  |
 | Telemetría WebSocket del Feature Hub (APK)   | Polling `dumpsys battery` / `dumpsys media_session`            |
+| APK companion (`adb install AndroidDex.apk`) | Instalador WebADB (fetch → sync push → `pm install -r`)         |
+| Puente local del APK (JAR → tcp:8457)        | `adb.createSocket("tcp:8457")` (protocolo JSON de líneas)      |
+| `get_all_apps` (análisis de apps del JAR)    | `companionBridge.getApps()` — nombres + íconos base64 reales   |
+
+### Launcher original (v3)
+
+El release oficial de Android-Dex empaqueta `AndroidDex.apk`, el companion
+que convierte el display virtual en un escritorio real:
+
+- `com.shrey.androiddex/.MainActivity` — actividad **HOME** (launcher)
+- `ServerStartService` — puente de servicios (batería, apps, íconos, notificaciones)
+  escuchando en `127.0.0.1:8457` del dispositivo
+- Protocolo de líneas JSON: `{"type":"get_all_apps"}` → lista de apps con
+  `app_name`, `package_name`, `version_name`, `is_system` e `icon_base64`
+
+DexPort lo sirve en `/androiddex-launcher.apk` (byte-idéntico al original,
+SHA-256 `76f09aac…ac3b30`) y al conectar el teléfono ofrece instalarlo y
+lanzarlo automáticamente en el display virtual — sin PC.
 
 ### Comandos DeX reenviados (idénticos al original)
 
@@ -63,7 +89,14 @@ scrcpy --new-display=1920x1080 --vd-system-decorations --video-codec=h264 \
 2. Conecta el teléfono por USB
 3. **Iniciar DexPort** → elige el dispositivo en el diálogo WebUSB
 4. Acepta «Permitir depuración USB» en el teléfono (marca «Siempre»)
-5. Escritorio DeX en el navegador 🎉
+5. Cuando aparezca la tarjeta del **launcher original**, pulsa
+   **Instalar launcher original (44 MB)** — se descarga, se sube por WebADB y
+   se instala con `pm install -r`; al terminar se abre solo en el escritorio
+6. Escritorio DeX en el navegador 🎉
+
+> También puedes descargar el APK directamente desde la landing
+> (`Descargar APK`) e instalarlo con `adb install AndroidDex.apk` si lo
+> prefieres manualmente.
 
 ### Controles
 
