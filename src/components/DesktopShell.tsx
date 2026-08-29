@@ -15,7 +15,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { DisplayCanvas } from "./DisplayCanvas";
-import { Taskbar } from "./Taskbar";
+import { Taskbar, TaskbarPill } from "./Taskbar";
+import { WindowControls } from "./WindowControls";
 import { AppDrawer } from "./AppDrawer";
 import { TaskView } from "./TaskView";
 import { MediaPanel, DevicePanel, SettingsPanel, ShortcutsModal } from "./Panels";
@@ -29,6 +30,7 @@ export function DesktopShell() {
   const phase = useStore((s) => s.phase);
   const showClock = useStore((s) => s.uiPrefs.showClock);
   const autoHideTaskbar = useStore((s) => s.uiPrefs.autoHideTaskbar);
+  const taskbarCollapsed = useStore((s) => s.uiPrefs.taskbarCollapsed);
   const mainRef = useRef<HTMLElement>(null);
   const [taskbarVisible, setTaskbarVisible] = useState(true);
 
@@ -93,11 +95,13 @@ export function DesktopShell() {
 
   return (
     <div className="dex-wallpaper relative flex h-full w-full flex-col overflow-hidden">
-      {/* Área del display virtual */}
+      {/* Área del display virtual — ocupa TODO el alto: la taskbar flota encima */}
       <main ref={mainRef} className="relative min-h-0 flex-1">
         <DisplayCanvas focused={phase === "desktop"} />
         {/* Reloj analógico decorativo (ocultable desde Ajustes) */}
         {phase === "desktop" && showClock && <AnalogClock />}
+        {/* v8: controles estilo Windows de la app activa (esquina sup. derecha) */}
+        <WindowControls />
         <AppDrawer />
         {/* v7: vista «Apps abiertas» estilo Windows (botón Recientes) */}
         <TaskView />
@@ -107,9 +111,13 @@ export function DesktopShell() {
         <ShortcutsModal />
       </main>
 
-      <div className={taskbarVisible ? "" : "h-0 overflow-hidden"}>
-        <Taskbar />
-      </div>
+      {/* v8: barra de tareas FLOTANTE — desplegada o en pastilla pequeña;
+          el auto-ocultar (hover inferior) sigue disponible */}
+      {phase === "desktop" && taskbarCollapsed ? (
+        <TaskbarPill />
+      ) : (
+        taskbarVisible && <Taskbar />
+      )}
       <CompanionPromptFloat />
       {/* v4: pantalla de selección de launcher (modal del escritorio) */}
       <LauncherPicker />

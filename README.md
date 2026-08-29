@@ -7,7 +7,28 @@ Port web del proyecto [Android DEX](https://github.com/Shrey113/Android-Dex) de
 escritorio DeX completo (apps en ventanas freeform, audio, control de mouse y
 teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
-> 🔗 **Demo en vivo:** <https://dexport-app.vercel.app>
+> 🔗 **Demo en vivo:** <https://dexport-mu.vercel.app>
+
+> 🚀 **v8** — **DexPort Agent + escritorio estilo Windows real**:
+> · **Taskbar flotante y ocultable** — la barra ahora flota sobre el
+>   escritorio (DeX style) con un botón de **minimizar** que la convierte en
+>   una pastilla pequeña en la esquina; un clic la devuelve a su estado
+>   natural.
+> · **Controles de ventana estilo Windows** — minimizar · ventana · pantalla
+>   completa · cerrar en la esquina del escritorio, aplicados a la app activa
+>   del display virtual.
+> · **DexPort Agent** (nuevo, 45 KB): app con **permiso de accesibilidad**
+>   que mapea lo que ADB no puede ver — apps y ventanas abiertas de AMBAS
+>   pantallas con título, actividad, foco y (Android 13+) display de cada
+>   ventana — y ejecuta ATRÁS/HOME/Recientes de forma fiable
+>   (`performGlobalAction`). Se instala **y recibe permisos por ADB**, sin
+>   tocar el teléfono. Protocolo de líneas JSON en `tcp:8458`.
+> · **Fix «No hay apps abiertas»**: la detección ahora es multi-fuente
+>   (agente + `dumpsys activity` + `dumpsys window windows` + `am stack list`
+>   + foco global) fusionada con prioridad por fiabilidad — el viejo grep se
+>   agotaba antes de llegar al display virtual.
+> · **ATRÁS definitivo**: cadena `input -d` → agente → control scrcpy →
+>   keyevent plano.
 
 > 🚀 **v7** — **Gestión de ventanas estilo Windows**: el botón «Recientes»
 > ya no abre los recientes del teléfono — abre la nueva vista **«Apps

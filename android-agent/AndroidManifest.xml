@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DexPort Agent — manifiesto
+  ════════════════════════════════════════════════════════════
+  App auxiliar con permiso de ACCESIBILIDAD que expone por TCP
+  (localhost:8458, protocolo de líneas JSON idéntico al companion
+  original) todo lo que ADB no puede ver:
+
+    · ventanas interactivas de TODAS las pantallas (teléfono +
+      display virtual scrcpy) con paquete, título, foco y display
+    · apps abiertas reales (tareas) con su actividad
+    · eventos de cambio de ventana (actividad en primer plano)
+    · acciones globales fiables (ATRÁS/HOME/RECIENTES/notifs)
+
+  La web de DexPort lo consulta vía adb.createSocket("tcp:8458").
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dexport.agent">
+
+    <!-- ServerSocket localhost:8458 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-sdk
+        android:minSdkVersion="26"
+        android:targetSdkVersion="34" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".AgentAccessibilityService"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+    </application>
+</manifest>

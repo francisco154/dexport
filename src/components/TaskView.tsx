@@ -24,6 +24,10 @@ import {
   Smartphone,
   LayoutGrid,
   RefreshCw,
+  ShieldCheck,
+  Download,
+  Loader2,
+  Radar,
 } from "lucide-react";
 import { useStore } from "../store/store";
 import { appColor, appInitial, type AppEntry } from "../utils/appNames";
@@ -77,7 +81,19 @@ function TaskCard({
                 activa
               </span>
             )}
+            {task.fromAgent && (
+              <span
+                className="text-[9px] text-sky-300/80"
+                title="Detectada por el DexPort Agent (exacta)"
+              >
+                ●
+              </span>
+            )}
           </div>
+          {/* v8: título real de la ventana cuando el agente está activo */}
+          {task.title ? (
+            <span className="block truncate text-[10px] text-[#7dd3fc]/80">{task.title}</span>
+          ) : null}
           <span className="block truncate text-[10px] text-[#9499a3]">
             {task.packageName}
           </span>
@@ -139,6 +155,83 @@ function TaskCard({
   );
 }
 
+/**
+ * v8: tarjeta del DexPort Agent — la app con permiso de accesibilidad
+ * que mapea TODO lo que ADB no ve (apps abiertas, ventanas, foco…).
+ * Aparece en el TaskView cuando no hay tareas detectadas o cuando el
+ * agente aún no está activo: es el fix real del «No hay apps abiertas».
+ */
+function AgentCard({ prominent = false }: { prominent?: boolean }) {
+  const agentStatus = useStore((s) => s.agentStatus);
+  const agentPing = useStore((s) => s.agentPing);
+  const agentInstall = useStore((s) => s.agentInstall);
+  const installAgent = useStore((s) => s.installAgent);
+  const checkAgent = useStore((s) => s.checkAgent);
+
+  if (agentStatus === "connected") {
+    return (
+      <div className="flex items-center gap-2 rounded-full border border-sky-400/25 bg-sky-400/10 px-3 py-1.5 text-[11.5px] text-sky-200">
+        <ShieldCheck size={13} className="text-sky-300" />
+        DexPort Agent activo{agentPing ? ` · Android ${agentPing.android}` : ""} —
+        detección exacta de ventanas
+      </div>
+    );
+  }
+
+  const busy = agentInstall.phase === "downloading" ||
+    agentInstall.phase === "pushing" || agentInstall.phase === "installing" ||
+    agentInstall.phase === "enabling" || agentInstall.phase === "verifying";
+
+  if (busy) {
+    return (
+      <div className="flex items-center gap-2.5 rounded-2xl border border-sky-400/25 bg-sky-400/8 px-4 py-3 text-[12.5px] text-sky-100">
+        <Loader2 size={15} className="animate-spin text-sky-300" />
+        <span className="flex-1">DexPort Agent — {agentInstall.message}</span>
+        <span className="font-mono text-[11px] text-sky-300">
+          {Math.round(agentInstall.progress * 100)}%
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`${prominent ? "" : "mt-4"} flex flex-wrap items-center gap-3 rounded-2xl border border-sky-400/25 bg-sky-400/8 px-4 py-3`}
+    >
+      <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-[#0d3a42] to-[#051c2b] ring-1 ring-sky-300/20">
+        <Radar size={16} className="text-sky-300" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-[12.5px] font-semibold text-white">
+          {agentStatus === "no-permission"
+            ? "Activa el DexPort Agent para ver las apps abiertas"
+            : "Instala el DexPort Agent (45 KB) para ver las apps abiertas"}
+        </p>
+        <p className="mt-0.5 text-[11.5px] leading-relaxed text-[#aab3bf]">
+          App con permiso de accesibilidad que mapea ventanas, apps y foco de
+          ambas pantallas — se instala y se le dan permisos por ADB, sin tocar
+          el teléfono.
+        </p>
+      </div>
+      <div className="flex items-center gap-2">
+        <button className="btn-solid !py-2 !text-[12px]" onClick={() => void installAgent()}>
+          <Download size={12} />
+          {agentStatus === "no-permission" ? "Reintentar permisos" : "Instalar Agent"}
+        </button>
+        {agentStatus !== "missing" && (
+          <button
+            className="btn-ghost !py-2 !text-[12px]"
+            title="Comprobar de nuevo"
+            onClick={() => void checkAgent()}
+          >
+            <RefreshCw size={12} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function TaskView() {
   const open = useStore((s) => s.panels.taskViewOpen);
   const togglePanel = useStore((s) => s.togglePanel);
@@ -148,6 +241,8 @@ export function TaskView() {
   const systemApps = useStore((s) => s.systemApps);
   const taskAction = useStore((s) => s.taskAction);
   const refreshRunningApps = useStore((s) => s.refreshRunningApps);
+  const agentStatus = useStore((s) => s.agentStatus);
+  const launcherComponent = useStore((s) => s.selectedLauncherComponent);
 
   // refresco continuo mientras la vista está abierta (cada 2.5s)
   useEffect(() => {
@@ -164,8 +259,17 @@ export function TaskView() {
     return m;
   }, [userApps, systemApps]);
 
-  const desktopTasks = runningApps.filter((t) => t.displayId !== 0 && t.displayId === displayId);
-  const phoneTasks = runningApps.filter((t) => !(t.displayId !== 0 && t.displayId === displayId));
+  const vd = displayId ?? -1;
+  const launcherPkg = launcherComponent?.split("/")[0] ?? null;
+  // apps del escritorio — el launcher no cuenta (es el propio escritorio)
+  const desktopTasks = runningApps.filter(
+    (t) =>
+      t.displayId !== 0 &&
+      t.displayId === vd &&
+      t.type !== "home" &&
+      t.packageName !== launcherPkg,
+  );
+  const phoneTasks = runningApps.filter((t) => !(t.displayId !== 0 && t.displayId === vd));
 
   if (!open) return null;
 
@@ -176,20 +280,21 @@ export function TaskView() {
 
   return (
     <div
-      className="absolute inset-0 bottom-16 z-20 flex flex-col"
+      className="absolute inset-0 bottom-[92px] z-20 flex flex-col"
       onClick={(e) => {
         if (e.target === e.currentTarget) togglePanel("taskViewOpen", false);
       }}
     >
       <div className="glass-dark scrollable fade-in m-4 mb-2 flex-1 rounded-3xl p-6">
         {/* Header */}
-        <div className="mb-5 flex items-center justify-between">
+          <div className="mb-5 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <h2 className="font-serif text-2xl italic text-white">Apps abiertas</h2>
             <span className="text-[12px] text-[#9499a3]">
               {desktopTasks.length} en el escritorio
               {phoneTasks.length > 0 ? ` · ${phoneTasks.length} en el teléfono` : ""}
             </span>
+            {agentStatus === "connected" && <AgentCard />}
           </div>
           <div className="flex items-center gap-2">
             {desktopTasks.length > 1 && (
@@ -227,12 +332,17 @@ export function TaskView() {
           </div>
         </div>
 
+        {/* v8: estado del agente (chip compacto arriba) */}
+        {agentStatus !== "connected" && runningApps.length > 0 && <AgentCard />}
+
         {runningApps.length === 0 ? (
-          <div className="flex h-48 flex-col items-center justify-center gap-3 text-[#9499a3]">
+          <div className="flex flex-1 flex-col items-center justify-center gap-4 py-10 text-[#9499a3]">
             <LayoutGrid size={34} className="opacity-40" />
             <p className="text-sm">
               No hay apps abiertas todavía — ábrelas desde el botón de apps
             </p>
+            {/* v8: con apps abiertas que no aparecen → el agente lo arregla */}
+            {agentStatus !== "connected" && <AgentCard prominent />}
           </div>
         ) : (
           <>

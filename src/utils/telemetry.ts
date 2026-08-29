@@ -61,6 +61,8 @@ export interface RunningApp {
 /**
  * v7: tarea Android completa — la unidad de la gestión de ventanas
  * estilo Windows (taskbar con apps abiertas + TaskView).
+ * v8: `title` (del agente/ventanas), `fromAgent` (fuente exacta) y
+ * `taskId=-1` para tareas que solo existen como ventana (agente).
  */
 export interface TaskInfo {
   taskId: number;
@@ -73,13 +75,39 @@ export interface TaskInfo {
   visible: boolean;
   /** tarea superior (foco) de su display */
   focused: boolean;
+  /** título de la ventana (agente o dumpsys window) — para TaskView */
+  title?: string;
+  /** la información proviene del DexPort Agent (exacta) */
+  fromAgent?: boolean;
 }
 
-/** Comando único (1 stream ADB) con el inventario de tareas + foco global. */
+/**
+ * v8: volcado multi-fuente de tareas en UN stream (marcadores):
+ *
+ *   __ACT__   dumpsys activity activities — tareas con taskId/type por display
+ *             (Android 10/11 «Display #N»+TaskRecord · 12+ «Task{…}»)
+ *   __WIN__   dumpsys window windows — cada ventana con su pkg/actividad
+ *             y mDisplayId real (vitaminas para freeform/DeX y para ROMs
+ *             con secciones de activity confusas — Samsung One UI, HyperOS)
+ *   __STACK__ am stack list — tareas con displayId (fuente extra)
+ *   __FOCUS__ dumpsys window | mCurrentFocus — foco global
+ *
+ * La sección __ACT__ ya no arrastra ActivityRecord{…} (con muchas apps
+ * recientes, 170 líneas se agotaban ANTES de llegar al display virtual:
+ * esa era la causa del «No hay apps abiertas» con apps abiertas).
+ */
 export const TASK_DUMP_COMMAND =
-  "timeout 4 dumpsys activity activities 2>/dev/null" +
-  " | grep -E 'Display #[0-9]+|displayId=[0-9]+ rootTaskId|Task\\{|TaskRecord\\{|ActivityRecord\\{|type=[a-z]+|mCurrentFocus" +
-  " | head -170; echo __FOCUS__; timeout 3 dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -2";
+  "echo __ACT__;" +
+  " timeout 5 dumpsys activity activities 2>/dev/null" +
+  " | grep -E 'Display #[0-9]+|displayId=[0-9]+ rootTaskId|Task\\{|TaskRecord\\{|type=[a-z]+'" +
+  " | head -260;" +
+  " echo __WIN__;" +
+  " timeout 4 dumpsys window windows 2>/dev/null" +
+  " | grep -E 'Window #[0-9]+ Window\\{|mDisplayId=|displayId=' | head -200;" +
+  " echo __STACK__;" +
+  " timeout 3 am stack list 2>/dev/null | head -70;" +
+  " echo __FOCUS__;" +
+  " timeout 3 dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -2";
 
 /** Normaliza "pkg" + activity (.Main | Main | com.x.Main) → componente am start. */
 function buildComponent(pkg: string, act: string): string {
@@ -191,6 +219,236 @@ export function parseTasks(dump: string, focusInfo?: string): TaskInfo[] {
       const vdTask =
         withPkg.find((t) => t.displayId !== 0) ?? withPkg[withPkg.length - 1];
       vdTask.focused = true;
+    }
+  }
+  return list;
+}
+
+/** Entrada del volcado de ventanas (__WIN__): pkg/actividad + display real. */
+export interface WindowDumpEntry {
+  packageName: string;
+  activity: string | null;
+  displayId: number;
+}
+
+/**
+ * v8: parser de `dumpsys window windows`.
+ * Cada bloque:
+ *   Window #3 Window{abc u0 com.whatsapp/com.whatsapp.HomeActivity}:
+ *     mDisplayId=2 stackId=44
+ * → pkg + actividad de la ventana y el display REAL donde vive
+ *   (incluidas las ventanas freeform del escritorio DeX).
+ */
+export function parseWindowDump(out: string): WindowDumpEntry[] {
+  if (!out) return [];
+  const entries: WindowDumpEntry[] = [];
+  let current: WindowDumpEntry | null = null;
+  let sawDisplayForCurrent = false;
+  for (const rawLine of out.split("\n")) {
+    const line = rawLine.trim();
+    // ── cabecera de ventana con componente pkg/activity ──
+    const h = line.match(
+      /Window #\d+ Window\{[0-9a-f]+ (?:\S+ )?([a-zA-Z][a-zA-Z0-9_.]*)\/(\S+?)[\s}]/,
+    );
+    if (h) {
+      const pkg = h[1];
+      const act = h[2].replace(/[:}]$/, "");
+      if (pkg === "android" || pkg === "com.android.systemui") {
+        current = null;
+        continue;
+      }
+      current = { packageName: pkg, activity: buildComponent(pkg, act), displayId: -1 };
+      sawDisplayForCurrent = false;
+      entries.push(current);
+      continue;
+    }
+    // ── display de la ventana en curso ──
+    const d = line.match(/^(?:m)?[dD]isplayId=(\d+)/);
+    if (d && current && !sawDisplayForCurrent) {
+      current.displayId = Number(d[1]);
+      sawDisplayForCurrent = true;
+    }
+  }
+  return entries;
+}
+
+/**
+ * v8: parser de `am stack list` (fuente extra de displayId por tarea):
+ *   Stack id=44 type=standard activityType=1 bounds=[0,0][...] displayId=2 userId=0
+ *     taskId=45: com.whatsapp/com.whatsapp.HomeActivity type=standard V=[...]
+ */
+export function parseStackList(out: string): TaskInfo[] {
+  if (!out) return [];
+  const tasks = new Map<number, TaskInfo>();
+  let displayId = -1;
+  for (const rawLine of out.split("\n")) {
+    const line = rawLine.trim();
+    const s = line.match(/^Stack id=\d+.*?displayId=(\d+)/);
+    if (s) {
+      displayId = Number(s[1]);
+      continue;
+    }
+    const t = line.match(/^taskId=(\d+):\s*([a-zA-Z][a-zA-Z0-9_.]*)\/(\S+)/);
+    if (t) {
+      const taskId = Number(t[1]);
+      const pkg = t[2];
+      if (pkg === "com.android.systemui" || tasks.has(taskId)) continue;
+      tasks.set(taskId, {
+        taskId,
+        packageName: pkg,
+        activity: buildComponent(pkg, t[3]),
+        displayId,
+        type: line.match(/\btype=([a-z]+)/)?.[1] ?? null,
+        visible: true,
+        focused: false,
+      });
+    }
+  }
+  return [...tasks.values()];
+}
+
+/** Divide la salida multi-marcador del TASK_DUMP_COMMAND v8. */
+export function splitTaskDump(out: string): {
+  act: string;
+  win: string;
+  stack: string;
+  focus: string;
+} {
+  const [act = "", rest1 = ""] = out.split("__WIN__");
+  const [win = "", rest2 = ""] = rest1.split("__STACK__");
+  const [stack = "", focus = ""] = rest2.split("__FOCUS__");
+  const actBody = act.includes("__ACT__") ? act.split("__ACT__")[1] ?? "" : act;
+  return { act: actBody, win, stack, focus };
+}
+
+/**
+ * v8: fusión de todas las fuentes de tareas (agente + dumpsys activity +
+ * dumpsys window + am stack list) en una lista coherente de TaskInfo.
+ *
+ * Prioridad: agente (exacto) > activity (taskId/type) > window (display
+ * real de cada ventana) > stack (display alternativo).
+ * El foco final lo decide: agente (isActive/isFocused) > mCurrentFocus >
+ * top del display del dump de activity.
+ */
+export function mergeTaskSources(input: {
+  act: TaskInfo[];
+  windows: WindowDumpEntry[];
+  stacks: TaskInfo[];
+  focusPkg: string | null;
+  virtualDisplayId: number | null;
+  /** tareas del DexPort Agent (si está conectado) */
+  agent?: {
+    packageName: string;
+    activity: string;
+    title: string;
+    displayId: number;
+    isActive: boolean;
+    isFocused: boolean;
+  }[];
+}): TaskInfo[] {
+  const { act, windows, stacks, focusPkg, virtualDisplayId, agent } = input;
+  const vd = virtualDisplayId ?? null;
+  const merged = new Map<string, TaskInfo>();
+
+  const upsert = (t: TaskInfo) => {
+    const key = t.packageName;
+    const cur = merged.get(key);
+    if (!cur) {
+      merged.set(key, t);
+      return;
+    }
+    // quedarse con la mejor información de cada campo
+    if (t.activity && !cur.activity) cur.activity = t.activity;
+    if (t.title && !cur.title) cur.title = t.title;
+    if (t.type && !cur.type) cur.type = t.type;
+    if (t.taskId > 0 && cur.taskId <= 0) cur.taskId = t.taskId;
+    // display: gana la fuente más fiable (agente > ventana > ya puesto)
+    if (t.fromAgent) cur.displayId = t.displayId;
+    else if (t.displayId >= 0 && !t.fromAgent) {
+      const curFromAgent = cur.fromAgent === true;
+      if (!curFromAgent) cur.displayId = t.displayId;
+    }
+    if (t.focused) {
+      for (const o of merged.values()) o.focused = false;
+      cur.focused = true;
+    }
+  };
+
+  // 1) dumpsys activity (taskId, type, display por secciones)
+  for (const t of act) upsert({ ...t });
+
+  // 2) ventanas (display REAL de cada ventana — p.ej. freeform en el VD)
+  for (const w of windows) {
+    const cur = merged.get(w.packageName);
+    if (cur) {
+      if (w.displayId >= 0) cur.displayId = w.displayId;
+      if (w.activity && !cur.activity) cur.activity = w.activity;
+    } else {
+      upsert({
+        taskId: -1,
+        packageName: w.packageName,
+        activity: w.activity,
+        displayId: w.displayId,
+        type: null,
+        visible: true,
+        focused: false,
+      });
+    }
+  }
+
+  // 3) am stack list (taskId + display alternativos)
+  for (const s of stacks) {
+    const cur = merged.get(s.packageName);
+    if (cur) {
+      if (s.taskId > 0 && cur.taskId <= 0) cur.taskId = s.taskId;
+      if (cur.displayId < 0 && s.displayId >= 0) cur.displayId = s.displayId;
+      if (s.activity && !cur.activity) cur.activity = s.activity;
+    } else {
+      upsert({ ...s });
+    }
+  }
+
+  // 4) agente (la fuente exacta: ventanas reales con título y foco)
+  if (agent && agent.length > 0) {
+    for (const a of agent) {
+      const cur = merged.get(a.packageName);
+      if (cur) {
+        if (a.activity) cur.activity = a.activity;
+        if (a.title) cur.title = a.title;
+        if (a.displayId >= 0) cur.displayId = a.displayId;
+        cur.fromAgent = true;
+        cur.visible = true;
+        if (a.isActive || a.isFocused) {
+          for (const o of merged.values()) o.focused = false;
+          cur.focused = true;
+        }
+      } else {
+        upsert({
+          taskId: -1,
+          packageName: a.packageName,
+          activity: a.activity || null,
+          displayId: a.displayId,
+          type: null,
+          visible: true,
+          focused: a.isActive || a.isFocused,
+          title: a.title,
+          fromAgent: true,
+        });
+      }
+    }
+  }
+
+  // 5) foco global (último refinamiento si nadie marcó foco)
+  const list = [...merged.values()];
+  const anyFocused = list.some((t) => t.focused);
+  if (!anyFocused && focusPkg) {
+    const withPkg = list.filter((t) => t.packageName === focusPkg);
+    if (withPkg.length > 0) {
+      const pick =
+        withPkg.find((t) => vd != null && t.displayId === vd) ??
+        withPkg.find((t) => t.displayId !== 0) ??
+        withPkg[withPkg.length - 1];
+      pick.focused = true;
     }
   }
   return list;

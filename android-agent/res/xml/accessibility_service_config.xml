@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Config del AccessibilityService del DexPort Agent.
+
+  · flagRetrieveInteractiveWindows → getWindows()/getWindowsOnAllDisplays()
+    devuelven TODAS las ventanas interactivas (incluidas las del display
+    virtual de scrcpy y las ventanas freeform estilo DeX).
+  · typeWindowStateChanged → captura cada cambio de actividad en primer
+    plano (paquete + clase Activity) — la señal más fiable para saber
+    «qué app se abrió / quedó al frente» sin parsear dumpsys.
+  · typeWindowsChanged → aviso de que la lista de ventanas cambió
+    (apertura/cierre/minimizado) — el snapshot se consulta bajo demanda.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/acc_description"
+    android:notificationTimeout="150" />

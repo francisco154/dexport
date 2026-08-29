@@ -50,8 +50,19 @@ import {
   pollTelemetryBatch,
   TASK_DUMP_COMMAND,
   parseTasks,
+  parseWindowDump,
+  parseStackList,
+  splitTaskDump,
+  mergeTaskSources,
+  parseCurrentFocus,
 } from "../utils/telemetry";
 import { parsePackageList, type AppEntry } from "../utils/appNames";
+import {
+  agentBridge,
+  type AgentPing,
+  type AgentInstallProgress,
+  type AgentTask,
+} from "../services/agent";
 
 export type Phase = "landing" | "boot" | "desktop";
 
@@ -97,12 +108,22 @@ export interface UiPrefs {
   showTaskbarNav: boolean;
   /** la taskbar se esconde sola y aparece al acercar el mouse abajo */
   autoHideTaskbar: boolean;
+  /** v8: la taskbar flotante está minimizada (pastilla pequeña) */
+  taskbarCollapsed: boolean;
+  /** v8: controles estilo Windows de la app activa en una esquina */
+  showWindowControls: boolean;
 }
 
-const UI_PREFS_KEY = "dexport.ui.v2";
+const UI_PREFS_KEY = "dexport.ui.v3";
 
 function loadUiPrefs(): UiPrefs {
-  const defaults: UiPrefs = { showClock: true, showTaskbarNav: true, autoHideTaskbar: false };
+  const defaults: UiPrefs = {
+    showClock: true,
+    showTaskbarNav: true,
+    autoHideTaskbar: false,
+    taskbarCollapsed: false,
+    showWindowControls: true,
+  };
   try {
     const raw = localStorage.getItem(UI_PREFS_KEY);
     if (raw) return { ...defaults, ...JSON.parse(raw) };
@@ -186,6 +207,15 @@ interface DexPortState {
   /** v7: tareas abiertas en TODOS los displays (gestión estilo Windows) */
   runningApps: TaskInfo[];
 
+  // ── v8: DexPort Agent (accesibilidad) ──
+  /** "checking" | "missing" | "no-permission" | "connected" | "unknown" */
+  agentStatus: "checking" | "missing" | "no-permission" | "connected" | "unknown";
+  agentPing: AgentPing | null;
+  /** progreso de la instalación (para la UI) */
+  agentInstall: AgentInstallProgress;
+  /** tareas crudas del agente (títulos reales de ventanas) */
+  agentTasks: AgentTask[];
+
   // ── Panels ──
   panels: PanelState;
   toasts: { id: number; message: string; kind: "info" | "error" | "success" }[];
@@ -234,6 +264,12 @@ interface DexPortState {
   refreshApps: () => Promise<void>;
   refreshTelemetry: () => Promise<void>;
   refreshRunningApps: () => Promise<void>;
+  /** v8: estado del DexPort Agent (instalado / permiso / puente) */
+  checkAgent: () => Promise<void>;
+  /** v8: instala el agente + permiso de accesibilidad por ADB */
+  installAgent: () => Promise<void>;
+  /** v8: acciones globales del agente (ATRÁS/HOME/… fiables) */
+  agentAction: (a: "back" | "home" | "recents" | "notifications" | "quick_settings" | "lock_screen" | "all_apps") => Promise<boolean>;
   setAudioMuted: (m: boolean) => void;
   setVolume: (v: number) => void;
   goHome: () => void;
@@ -347,6 +383,12 @@ export const useStore = create<DexPortState>((set, get) => ({
   systemApps: [],
   appsLoading: false,
   runningApps: [],
+
+  // ── v8: DexPort Agent (accesibilidad) ──
+  agentStatus: "checking",
+  agentPing: null,
+  agentInstall: { phase: "idle", progress: 0, message: "" },
+  agentTasks: [],
 
   panels: {
     drawerOpen: false,
@@ -668,6 +710,8 @@ export const useStore = create<DexPortState>((set, get) => ({
       startTelemetryLoop();
       startAppMonitorLoop();
       startLauncherWatchdog();
+      // v8: detectar el DexPort Agent (accesibilidad) al conectar
+      void get().checkAgent();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       get().setAppBoot({ message: "Error durante el arranque", isError: true });
@@ -1191,16 +1235,111 @@ export const useStore = create<DexPortState>((set, get) => ({
     }
   },
 
+  /**
+   * v8: refresco multi-fuente de las apps abiertas.
+   *   1. DexPort Agent (si está conectado) — ventanas reales con título,
+   *      actividad y (API 33+) display de cada una. Fuente EXACTA.
+   *   2. dumpsys activity activities — taskId + tipo por display.
+   *   3. dumpsys window windows — display real de cada VENTANA (freeform).
+   *   4. am stack list — taskId + display alternativos.
+   *   5. mCurrentFocus — foco global.
+   * Todo el dump en UN stream con marcadores; el agente en paralelo.
+   */
   refreshRunningApps: async () => {
+    const vd = get().displayId;
+    const agentConnected = get().agentStatus === "connected";
+    const agentPromise: Promise<AgentTask[]> = agentConnected
+      ? agentBridge.getTasks().catch(() => [])
+      : Promise.resolve([]);
+
     try {
-      const out = await webAdb.shellSafe(TASK_DUMP_COMMAND, 12_000);
-      if (!out) return;
-      const [dump, focus] = out.split("__FOCUS__");
-      const tasks = parseTasks(dump ?? "", focus);
+      const [out, agent] = await Promise.all([
+        webAdb.shellSafe(TASK_DUMP_COMMAND, 15_000),
+        agentPromise,
+      ]);
+      const { act, win, stack, focus } = splitTaskDump(out);
+      const tasks = mergeTaskSources({
+        act: parseTasks(act), // foco interno por top de display
+        windows: parseWindowDump(win),
+        stacks: parseStackList(stack),
+        focusPkg: focus ? parseCurrentFocus(focus) : null,
+        virtualDisplayId: vd,
+        agent: agent.map((a) => ({
+          packageName: a.packageName,
+          activity: a.activity,
+          title: a.title,
+          displayId: a.displayId,
+          isActive: a.isActive,
+          isFocused: a.isFocused,
+        })),
+      });
+      if (agent.length > 0) set({ agentTasks: agent });
       set({ runningApps: tasks });
     } catch {
-      /* noop */
+      /* noop — el próximo tick reintenta */
     }
+  },
+
+  /**
+   * v8: estado del DexPort Agent:
+   *   connected     → puente 8458 responde (permiso activo)
+   *   no-permission → APK instalado pero el servicio no está habilitado
+   *   missing       → ni siquiera instalado
+   */
+  checkAgent: async () => {
+    if (!webAdb.adb) return;
+    set((s) => (s.agentStatus === "connected" ? {} : { agentStatus: "checking" }));
+    const pong = await agentBridge.ping();
+    if (pong) {
+      set({ agentStatus: "connected", agentPing: pong });
+      return;
+    }
+    const installed = await agentBridge.isInstalled();
+    set({
+      agentStatus: installed ? "no-permission" : "missing",
+      agentPing: null,
+      agentTasks: [],
+    });
+  },
+
+  /** v8: instalar el agente + conceder accesibilidad por ADB (automático). */
+  installAgent: async () => {
+    if (get().agentInstall.phase === "installing") return;
+    if (!webAdb.adb) {
+      get().toast("Conecta el dispositivo primero", "error");
+      return;
+    }
+    set({
+      agentInstall: { phase: "downloading", progress: 0, message: "Iniciando…" },
+    });
+    try {
+      const ok = await agentBridge.install((p) => set({ agentInstall: p }));
+      if (ok) {
+        set({ agentStatus: "connected" });
+        const pong = await agentBridge.ping();
+        if (pong) set({ agentPing: pong });
+        get().toast("DexPort Agent activo — detección de apps exacta ✓", "success");
+        void get().refreshRunningApps();
+      } else {
+        set({ agentStatus: "no-permission" });
+        get().toast(
+          "Agent instalado — actívalo en Ajustes → Accesibilidad → DexPort Agent",
+          "info",
+        );
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      set({
+        agentInstall: { phase: "error", progress: 0, message: msg, error: msg },
+      });
+      get().toast(`No se pudo instalar el Agent: ${msg.slice(0, 80)}`, "error");
+    }
+  },
+
+  /** v8: acción global vía agente (ATRÁS/HOME/… fiables). */
+  agentAction: async (a) => {
+    if (get().agentStatus !== "connected") return false;
+    return agentBridge.performAction(a);
   },
 
   setAudioMuted: (m) => {
@@ -1236,20 +1375,31 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v7: tecla de NAVEGACIÓN dirigida al display virtual — fix del
-   * «ATRÁS funciona a medias» y del «Recientes controla el teléfono».
-   *
-   * 1) `input -d <vd> keyevent <code>`: el evento lleva setDisplayId y
-   *    llega a la ventana enfocada del display virtual (fiable, Android 10+)
-   * 2) canal de control scrcpy (el fork también aplica setDisplayId por
-   *    reflexión — falla en silencio en algunos dispositivos)
-   * 3) input keyevent plano (modo espejo)
+   * v8: tecla de navegación dirigida al display virtual — ahora con
+   * CUÁDRUPLE estrategia (fix definitivo del «ATRÁS a medias»):
+   * 1) `input -d <vd> keyevent <code>` — evento con setDisplayId al
+   *    display virtual (fiable, Android 10+)
+   * 2) DexPort Agent `action.back/home/…` — performGlobalAction sobre
+   *    la ventana enfocada (funciona aunque el input -d falle)
+   * 3) canal de control scrcpy (keycode al display espejado)
+   * 4) input keyevent plano (último recurso)
    */
   sendNavKey: async (keycode) => {
     const vd = get().displayId;
     if (vd != null && vd > 0) {
       const ok = await webAdb.inputKeyeventOnDisplay(keycode, vd);
       if (ok) return;
+    }
+    // 2) agente: performGlobalAction (ATRÁS=4 HOME=3 RECIENTES…)
+    if (get().agentStatus === "connected") {
+      const AGENT_KEYS: Record<number, "back" | "home" | "recents" | "notifications"> = {
+        4: "back",
+        3: "home",
+        82: "recents",
+        83: "notifications",
+      };
+      const action = AGENT_KEYS[keycode];
+      if (action && (await agentBridge.performAction(action))) return;
     }
     const controller = displayEngine.controller;
     if (controller) {
@@ -1459,6 +1609,10 @@ export const useStore = create<DexPortState>((set, get) => ({
       userApps: [],
       systemApps: [],
       runningApps: [],
+      agentStatus: "checking",
+      agentPing: null,
+      agentInstall: { phase: "idle", progress: 0, message: "" },
+      agentTasks: [],
       displayId: null,
       controlOnline: false,
       mirrorMode: false,
@@ -1638,10 +1792,16 @@ function stopTelemetryLoop(): void {
 /** v2: AppMonitor port — apps visibles en el display virtual cada 4s */
 function startAppMonitorLoop(): void {
   stopAppMonitorLoop();
+  let tick = 0;
   appMonitorTimer = setInterval(() => {
     const s = useStore.getState();
     if (s.phase === "desktop" && !s.reconnecting && s.displayId != null) {
       void s.refreshRunningApps();
+      // v8: reintentar el agente cada ~24s si no está conectado
+      tick++;
+      if (s.agentStatus !== "connected" && tick % 6 === 0) {
+        void s.checkAgent();
+      }
     }
   }, 4000);
 }

@@ -34,6 +34,10 @@ import {
   Grid2x2,
   LayoutGrid,
   ChevronDown,
+  ShieldCheck,
+  Radar,
+  Download,
+  Loader2,
 } from "lucide-react";
 import { useStore } from "../store/store";
 import { QUICK_KEYS } from "../utils/androidKeys";
@@ -359,6 +363,99 @@ export function DevicePanel() {
 }
 
 /** ── Ajustes del display virtual (v6: pantalla, personalización, calidad) ── */
+
+/**
+ * v8: sección del DexPort Agent — estado + instalación + explicación.
+ * El agente da la detección EXACTA de apps/ventanas y acciones fiables.
+ */
+function AgentSettingsSection() {
+  const agentStatus = useStore((s) => s.agentStatus);
+  const agentPing = useStore((s) => s.agentPing);
+  const agentInstall = useStore((s) => s.agentInstall);
+  const installAgent = useStore((s) => s.installAgent);
+  const checkAgent = useStore((s) => s.checkAgent);
+
+  const busy =
+    agentInstall.phase === "downloading" || agentInstall.phase === "pushing" ||
+    agentInstall.phase === "installing" || agentInstall.phase === "enabling" ||
+    agentInstall.phase === "verifying";
+
+  const statusLabel: Record<string, string> = {
+    checking: "Comprobando…",
+    missing: "No instalado",
+    "no-permission": "Instalado — falta permiso de accesibilidad",
+    connected: "Activo",
+    unknown: "Desconocido",
+  };
+  const statusColor: Record<string, string> = {
+    checking: "text-[#9499a3]",
+    missing: "text-[#f59e0b]",
+    "no-permission": "text-[#f59e0b]",
+    connected: "text-[#3ddc84]",
+    unknown: "text-[#9499a3]",
+  };
+
+  return (
+    <>
+      <h3 className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
+        <Radar size={13} className="text-sky-300/70" />
+        DexPort Agent · detección de ventanas
+      </h3>
+      <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-sky-400/15 bg-sky-400/5 p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-[13px] font-medium text-white">
+              App auxiliar con permiso de accesibilidad
+            </p>
+            <p className={`text-[11.5px] ${statusColor[agentStatus] ?? "text-[#9499a3]"}`}>
+              {agentStatus === "connected" && agentPing
+                ? `Activo · Android ${agentPing.android} (${agentPing.device})`
+                : statusLabel[agentStatus] ?? agentStatus}
+            </p>
+          </div>
+          {agentStatus === "connected" ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-[#3ddc84]/15 px-3 py-1.5 text-[11.5px] font-semibold text-[#3ddc84]">
+              <ShieldCheck size={13} /> OK
+            </span>
+          ) : busy ? (
+            <span className="flex items-center gap-2 rounded-full bg-sky-400/10 px-3 py-1.5 text-[11.5px] text-sky-200">
+              <Loader2 size={13} className="animate-spin" />
+              {Math.round(agentInstall.progress * 100)}%
+            </span>
+          ) : (
+            <button className="btn-solid !py-2 !text-[12px]" onClick={() => void installAgent()}>
+              <Download size={12} />
+              {agentStatus === "missing" ? "Instalar (45 KB)" : "Activar"}
+            </button>
+          )}
+        </div>
+
+        <p className="text-[11.5px] leading-relaxed text-[#aab3bf]">
+          El agente mapea lo que ADB no puede ver: apps y ventanas abiertas en
+          ambas pantallas (título, actividad y foco por display) y ejecuta
+          Atrás/Inicio/Recientes de forma fiable. Se instala y recibe permisos
+          por ADB — sin tocar el teléfono. Todo queda en tu dispositivo (USB).
+        </p>
+        {agentStatus === "no-permission" && (
+          <p className="rounded-xl bg-amber-400/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
+            Si «Activar» no lo conecta, abre en el teléfono: Ajustes →
+            Accesibilidad → DexPort Agent → activar. (Algunas ROMs lo piden
+            manualmente la primera vez.)
+          </p>
+        )}
+        {agentStatus !== "connected" && !busy && (
+          <button
+            className="btn-ghost w-fit !py-1.5 !text-[11.5px]"
+            onClick={() => void checkAgent()}
+          >
+            <RotateCcw size={11} /> Comprobar de nuevo
+          </button>
+        )}
+      </div>
+    </>
+  );
+}
+
 export function SettingsPanel() {
   const open = useStore((s) => s.panels.settingsOpen);
   const togglePanel = useStore((s) => s.togglePanel);
@@ -494,7 +591,16 @@ export function SettingsPanel() {
           checked={uiPrefs.autoHideTaskbar}
           onChange={(v) => setUiPrefs({ autoHideTaskbar: v })}
         />
+        <Toggle
+          label="Botones de ventana estilo Windows"
+          hint="Controles (minimizar · ventana · pantalla completa · cerrar) de la app activa, en la esquina superior derecha del escritorio."
+          checked={uiPrefs.showWindowControls}
+          onChange={(v) => setUiPrefs({ showWindowControls: v })}
+        />
       </div>
+
+      {/* ═══════════ v8: DEXPORT AGENT (accesibilidad) ═══════════ */}
+      <AgentSettingsSection />
 
       <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         Resolución del display virtual

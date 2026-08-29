@@ -83,7 +83,7 @@ export function AppDrawer() {
 
   return (
     <div
-      className="absolute inset-0 bottom-16 z-20 flex flex-col"
+      className="absolute inset-0 bottom-[92px] z-20 flex flex-col"
       onClick={(e) => {
         if (e.target === e.currentTarget) togglePanel("drawerOpen", false);
       }}

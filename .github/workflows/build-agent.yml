@@ -1,0 +1,39 @@
+name: Build DexPort Agent APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "android-agent/**"
+
+jobs:
+  build-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "build-tools;34.0.0" "platforms;android-34" > /dev/null
+
+      - name: Build APK (aapt2 + javac + d8 + apksigner)
+        run: |
+          ANDROID_SDK=$ANDROID_HOME ./android-agent/build.sh
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dexport-agent-apk
+          path: android-agent/dexport-agent.apk

@@ -11,6 +11,7 @@ import {
   Home,
   ChevronLeft,
   ChevronUp,
+  ChevronDown,
   Grid2x2,
   Search,
   Settings,
@@ -32,6 +33,7 @@ import {
   Minus,
   Square,
   X,
+  LayoutGrid,
 } from "lucide-react";
 import { displayEngine, useStore } from "../store/store";
 import { webAdb } from "../services/adb";
@@ -113,6 +115,7 @@ function RunningTasksStrip() {
   const userApps = useStore((s) => s.userApps);
   const systemApps = useStore((s) => s.systemApps);
   const taskAction = useStore((s) => s.taskAction);
+  const launcherComponent = useStore((s) => s.selectedLauncherComponent);
   const [menu, setMenu] = useState<{
     task: TaskInfo;
     entry?: AppEntry;
@@ -128,18 +131,22 @@ function RunningTasksStrip() {
   }, [userApps, systemApps]);
 
   const vd = displayId ?? -1;
+  const launcherPkg = launcherComponent?.split("/")[0] ?? null;
   // una entrada por app (la tarea superior); solo apps del display virtual
+  // (el launcher NO cuenta: es el propio escritorio)
   const tasks = useMemo(() => {
     const seen = new Set<string>();
     const out: TaskInfo[] = [];
     for (const t of runningApps) {
       if (t.displayId !== vd) continue;
+      if (launcherPkg && t.packageName === launcherPkg) continue;
+      if (t.type === "home") continue;
       if (seen.has(t.packageName)) continue;
       seen.add(t.packageName);
       out.push(t);
     }
     return out.slice(0, 12);
-  }, [runningApps, vd]);
+  }, [runningApps, vd, launcherPkg]);
 
   if (tasks.length === 0) return null;
 
@@ -311,6 +318,8 @@ export function Taskbar() {
   const displayId = useStore((s) => s.displayId);
   const runningApps = useStore((s) => s.runningApps);
   const showTaskbarNav = useStore((s) => s.uiPrefs.showTaskbarNav);
+  const agentStatus = useStore((s) => s.agentStatus);
+  const setUiPrefs = useStore((s) => s.setUiPrefs);
 
   const sendKey = (key: number) => {
     sendKeyAction(key);
@@ -326,7 +335,7 @@ export function Taskbar() {
   };
 
   return (
-    <footer className="taskbar relative z-30 flex h-16 select-none items-center gap-2 px-3">
+    <footer className="taskbar taskbar-float z-30 flex h-16 select-none items-center gap-2 px-4">
       {/* ── Navegación (izquierda) — ocultable desde Ajustes ── */}
       {showTaskbarNav && (
       <div className="flex items-center gap-1">
@@ -358,7 +367,7 @@ export function Taskbar() {
         >
           <Info size={18} />
         </button>
-        {/* indicador de estado del canal de control */}
+        {/* indicador de estado del canal de control + agente */}
         <div
           className={`ml-1 h-2 w-2 rounded-full ${controlOnline ? "bg-[#3ddc84]" : "bg-[#f59e0b] pulse-glow"}`}
           title={
@@ -367,6 +376,12 @@ export function Taskbar() {
               : "Canal de control no disponible — los botones usan comandos shell (más lentos)"
           }
         />
+        {agentStatus === "connected" && (
+          <div
+                       className="h-2 w-2 rounded-full bg-[#38bdf8]"
+            title="DexPort Agent activo — detección de apps y acciones exactas"
+          />
+        )}
       </div>
       )}
 
@@ -455,7 +470,44 @@ export function Taskbar() {
         </button>
 
         <Clock />
+
+        {/* ── v8: minimizar la barra flotante (la devuelve a su pastilla) ── */}
+        <button
+          className="taskbar-btn taskbar-collapse !h-9 !w-9"
+          title="Minimizar barra — queda un botón pequeño en la esquina"
+          onClick={() => setUiPrefs({ taskbarCollapsed: true })}
+        >
+          <ChevronDown size={17} />
+        </button>
       </div>
     </footer>
+  );
+}
+
+/**
+ * v8: pastilla flotante de la barra minimizada — un botón pequeño que
+ * no moleste; un clic (o hover en el borde inferior) la despliega de nuevo.
+ */
+export function TaskbarPill() {
+  const setUiPrefs = useStore((s) => s.setUiPrefs);
+  const runningApps = useStore((s) => s.runningApps);
+  const displayId = useStore((s) => s.displayId);
+  const vd = displayId ?? -1;
+  const desktopCount = runningApps.filter(
+    (t) => t.displayId !== 0 && t.displayId === vd,
+  ).length;
+  return (
+    <button
+      className="taskbar-pill fade-in"
+      title="Mostrar barra de tareas"
+      onClick={() => setUiPrefs({ taskbarCollapsed: false })}
+    >
+      <LayoutGrid size={15} className="text-[#7dd3fc]" />
+      {desktopCount > 0 && (
+        <span className="absolute -right-0.5 -top-0.5 grid h-4 min-w-4 place-items-center rounded-full bg-[#38bdf8] px-1 text-[9px] font-bold text-[#04121f]">
+          {desktopCount}
+        </span>
+      )}
+    </button>
   );
 }
