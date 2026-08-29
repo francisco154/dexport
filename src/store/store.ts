@@ -1,8 +1,23 @@
 /**
- * DexPort — Store central
+ * DexPort v2 — Store central
  * ════════════════════════════════════════════════════════════
  * Port del AppManager (orquestador del boot) + AndroidCore (estado
  * reactivo del dispositivo) del original, adaptados a zustand/React.
+ *
+ * v2 — correcciones de la ingeniería inversa del build original:
+ *   - Boot NO bloqueante: la sincronización de telemetría/apps va en
+ *     background (v1 se colgaba en el 93% si un dumpsys se bloqueaba).
+ *   - initDesktop(): al primer frame se lanza el LAUNCHER del teléfono
+ *     en el display virtual (`am start --display N ... HOME`) — así el
+ *     display deja de ser negro: wallpaper, app grid y ventanas freeform,
+ *     exactamente como el modo Normal del original.
+ *   - launchApp usa el mensaje de control START_APP de scrcpy 3.3
+ *     (idéntico al AppController.startAppOnDisplay del JAR original),
+ *     con fallback a `am start --display N` por shell.
+ *   - AppMonitor: port del monitor de tareas del servidor original
+ *     (`dumpsys activity activities`, regex Display #N + Task visible).
+ *   - controlOnline: feedback visible del canal de control (v1 fallaba
+ *     en silencio y "los botones no hacían nada").
  */
 
 import { create } from "zustand";
@@ -15,8 +30,9 @@ import {
 import {
   type BatteryState,
   type MediaSession,
-  parseBattery,
-  parseMediaSessions,
+  type RunningApp,
+  pollTelemetryBatch,
+  parseRunningApps,
 } from "../utils/telemetry";
 import { parsePackageList, type AppEntry } from "../utils/appNames";
 
@@ -56,6 +72,14 @@ interface DexPortState {
   fps: number;
   audioMuted: boolean;
   volume: number;
+  /** v2: display virtual real creado por scrcpy en el dispositivo */
+  displayId: number | null;
+  /** v2: canal de control scrcpy operativo (mouse/teclado) */
+  controlOnline: boolean;
+  /** v2: modo espejo (fallback cuando el dispositivo no soporta VD) */
+  mirrorMode: boolean;
+  /** v2: launcher detectado (para relanzar HOME en el display) */
+  launcherPkg: string | null;
 
   // ── Telemetría (AndroidCore port) ──
   battery: BatteryState | null;
@@ -66,6 +90,8 @@ interface DexPortState {
   userApps: AppEntry[];
   systemApps: AppEntry[];
   appsLoading: boolean;
+  /** v2: apps visibles en el display virtual (AppMonitor port) */
+  runningApps: RunningApp[];
 
   // ── Panels ──
   panels: PanelState;
@@ -88,11 +114,16 @@ interface DexPortState {
   startBoot: () => Promise<void>;
   retryBoot: () => Promise<void>;
   launchApp: (pkg: string) => Promise<void>;
+  launchHome: () => Promise<void>;
+  /** v2: flujo post-display: launcher + HOME en el display virtual */
+  initDesktopAfterDisplay: (displayId: number) => Promise<void>;
   refreshApps: () => Promise<void>;
   refreshTelemetry: () => Promise<void>;
+  refreshRunningApps: () => Promise<void>;
   setAudioMuted: (m: boolean) => void;
   setVolume: (v: number) => void;
   goHome: () => void;
+  sendKeyAction: (keycode: number) => void;
   reconnectDesktop: () => Promise<void>;
   shutdown: () => Promise<void>;
 }
@@ -123,6 +154,7 @@ function saveSettings(s: DisplaySettings): void {
 export const displayEngine = new DisplayEngine();
 
 let telemetryTimer: ReturnType<typeof setInterval> | null = null;
+let appMonitorTimer: ReturnType<typeof setInterval> | null = null;
 let toastSeq = 1;
 
 export const useStore = create<DexPortState>((set, get) => ({
@@ -141,6 +173,10 @@ export const useStore = create<DexPortState>((set, get) => ({
   fps: 0,
   audioMuted: false,
   volume: 1,
+  displayId: null,
+  controlOnline: false,
+  mirrorMode: false,
+  launcherPkg: null,
 
   battery: null,
   mediaSessions: [],
@@ -149,6 +185,7 @@ export const useStore = create<DexPortState>((set, get) => ({
   userApps: [],
   systemApps: [],
   appsLoading: false,
+  runningApps: [],
 
   panels: {
     drawerOpen: false,
@@ -188,7 +225,7 @@ export const useStore = create<DexPortState>((set, get) => ({
 
   // ═════════════════════════════════════════════════════════
   // BOOT FLOW — port del AppManager.initializeSystem()
-  // (secuencia fiel: APP bar 0.02 → 1.00 + ENGINE bar paralela)
+  // v2: telemetría y apps en background — el boot NUNCA se bloquea
   // ═════════════════════════════════════════════════════════
   startBoot: async () => {
     const store = get();
@@ -285,15 +322,40 @@ export const useStore = create<DexPortState>((set, get) => ({
           }
         },
         onSizeChanged: (width, height) => set({ displaySize: { width, height } }),
+        onDisplayId: (displayId) => {
+          set({ displayId, mirrorMode: false });
+          get().toast(`Display virtual #${displayId} activo`, "success");
+          // v2: convertir el display vacío en escritorio real
+          void get().initDesktopAfterDisplay(displayId);
+        },
+        onControllerReady: () => set({ controlOnline: true }),
         onExited: async () => {
           const s = get();
           if (s.phase === "desktop") {
             await s.reconnectDesktop();
           } else if (s.phase === "boot" && !s.bootError) {
-            s.setBootError(
-              "El motor de display se detuvo inesperadamente. Revisa que el dispositivo soporte displays virtuales (Android 10+) y reintenta.",
-              true,
+            // v2: primer intento — fallback a modo espejo
+            const engineOk = await displayEngine.retryWithMirror(
+              webAdb.adb!,
+              document.getElementById("dex-display-canvas") as HTMLCanvasElement,
+              get().settings,
             );
+            if (engineOk) {
+              set({ mirrorMode: true });
+              get().toast(
+                "Tu dispositivo no soporta displays virtuales — modo espejo activado",
+                "info",
+              );
+              const st = get();
+              if (st.engineBoot.progress < 1) {
+                st.setEngineBoot({ message: "Espejo de pantalla activo ✓", progress: 1 });
+              }
+            } else {
+              s.setBootError(
+                "El motor de display se detuvo inesperadamente. Revisa que el dispositivo soporte displays virtuales (Android 10+) y reintenta.",
+                true,
+              );
+            }
           }
         },
         onClipboard: (text) => {
@@ -303,9 +365,36 @@ export const useStore = create<DexPortState>((set, get) => ({
           }
         },
         onLog: () => undefined,
+        onAudioWarn: (msg) => get().toast(msg, "info"),
       });
 
-      await displayEngine.start(adb, canvas, get().settings);
+      // v2: si el dispositivo no soporta displays virtuales, el servidor scrcpy
+      // muere al instante (AdbScrcpyExitedError) → fallback automático a espejo
+      try {
+        await displayEngine.start(adb, canvas, get().settings);
+      } catch (startErr) {
+        if (get().settings.virtualDisplay) {
+          const msg = startErr instanceof Error ? startErr.message : String(startErr);
+          store.setEngineBoot({
+            message: "Display virtual no soportado — cambiando a espejo…",
+            progress: 0.9,
+          });
+          const ok = await displayEngine.retryWithMirror(adb, canvas, get().settings);
+          if (ok) {
+            set({ mirrorMode: true });
+            get().toast(
+              "Display virtual no soportado en este dispositivo — modo espejo activado",
+              "info",
+            );
+          } else {
+            throw new Error(
+              `No se pudo iniciar el motor de video: ${msg}. Prueba bajar la resolución en Ajustes o reconecta el USB.`,
+            );
+          }
+        } else {
+          throw startErr;
+        }
+      }
       set({ displaySize: get().settings.virtualDisplay
         ? { width: get().settings.width, height: get().settings.height }
         : get().displaySize });
@@ -317,24 +406,30 @@ export const useStore = create<DexPortState>((set, get) => ({
       });
       await waitFor(
         () => get().engineBoot.progress >= 1,
-        15_000,
-        "El motor de video no respondió a tiempo. El dispositivo puede estar ocupado o no soportar displays virtuales.",
+        20_000,
       );
 
-      // ── 0.93: telemetría + apps ──
+      // ── 0.93→1.00: telemetría + apps EN BACKGROUND (fix del cuelgue) ──
       store.setAppBoot({
-        message: "Sincronizando telemetría y aplicaciones…",
+        message: "Preparando escritorio…",
         progress: 0.93,
       });
-      await Promise.all([get().refreshTelemetry(), get().refreshApps()]);
+      // NO se espera: el boot completa y la sync sigue de fondo
+      void get().refreshApps().then(() => {
+        const s = get();
+        if (s.phase === "boot") {
+          s.setAppBoot({ message: "Sistema listo ✓", progress: 1 });
+        }
+      });
+      void get().refreshTelemetry();
 
-      startTelemetryLoop();
-
-      // ── 1.00: sistema listo ──
-      store.setAppBoot({ message: "Sistema listo ✓", progress: 1 });
-      await sleep(350);
+      await sleep(250);
       set({ phase: "desktop" });
       get().toast("Escritorio DexPort conectado", "success");
+
+      // arrancar loops de fondo
+      startTelemetryLoop();
+      startAppMonitorLoop();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       get().setAppBoot({ message: "Error durante el arranque", isError: true });
@@ -351,23 +446,83 @@ export const useStore = create<DexPortState>((set, get) => ({
   // ACCIONES DEL ESCRITORIO
   // ═════════════════════════════════════════════════════════
 
+  /**
+   * v2: port del flujo del original al crear el display virtual:
+   * 1) detecta el launcher por defecto
+   * 2) lanza el HOME en el display virtual → wallpaper + app grid
+   * 3) sincroniza el listado de apps para el drawer
+   */
+  // (método extra colgado fuera de la interfaz zustand — ver abajo)
+
   launchApp: async (pkg) => {
     const controller = displayEngine.controller;
+    const displayName = get().displayId;
+    get().toast(`Lanzando ${pkg}…`, "info");
     try {
       if (controller) {
-        // scrcpy 3.x: startApp arranca la app EN el display virtual
+        // scrcpy 3.3: START_APP arranca la app EN el display virtual
+        // (mismo código que el JAR original: setLaunchDisplayId)
         await controller.startApp(pkg, { forceStop: false, searchByName: false });
-        get().toast(`Lanzando ${pkg}…`, "info");
+      } else if (displayName != null && displayName > 0) {
+        // fallback shell: am start --display N
+        await webAdb.launchOnDisplay(pkg, displayName);
       } else {
         await webAdb.shellSafe(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
       }
       get().togglePanel("drawerOpen", false);
     } catch {
-      // Fallback: launch por monkey en el display activo
-      await webAdb.shellSafe(
-        `monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`,
-      );
-      get().togglePanel("drawerOpen", false);
+      try {
+        if (displayName != null && displayName > 0) {
+          await webAdb.launchOnDisplay(pkg, displayName);
+        } else {
+          await webAdb.shellSafe(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
+        }
+        get().togglePanel("drawerOpen", false);
+      } catch {
+        get().toast(`No se pudo lanzar ${pkg}`, "error");
+      }
+    }
+  },
+
+  launchHome: async () => {
+    const displayId = get().displayId;
+    if (displayId != null && displayId > 0) {
+      const ok = await webAdb.launchHomeOnDisplay(displayId);
+      if (!ok) get().toast("No se pudo abrir el launcher", "error");
+    } else {
+      get().sendKeyAction(3); // KEYCODE_HOME
+    }
+  },
+
+  /**
+   * v2: port del flujo del original al crear el display virtual:
+   * 1) detecta el launcher por defecto
+   * 2) lanza el HOME en el display virtual → wallpaper + app grid
+   * 3) sincroniza las apps visibles (AppMonitor)
+   */
+  initDesktopAfterDisplay: async (displayId: number) => {
+    const s = get();
+    if (s.phase !== "boot" && s.phase !== "desktop") return;
+    try {
+      // 1) launcher por defecto
+      const launcher = await webAdb.getDefaultLauncher();
+      set({ launcherPkg: launcher });
+
+      // 2) HOME en el display virtual → escritorio real (wallpaper + grid)
+      const ok = await webAdb.launchHomeOnDisplay(displayId);
+      if (ok) {
+        get().toast(
+          launcher
+            ? `Launcher (${launcher}) abierto en el display #${displayId}`
+            : "Launcher abierto en el display virtual",
+          "success",
+        );
+      }
+
+      // 3) refrescar apps visibles
+      void get().refreshRunningApps();
+    } catch {
+      /* el display ya funciona — el launcher es un extra */
     }
   },
 
@@ -375,8 +530,8 @@ export const useStore = create<DexPortState>((set, get) => ({
     set({ appsLoading: true });
     try {
       const [userOut, sysOut] = await Promise.all([
-        webAdb.shellSafe("pm list packages -3"),
-        webAdb.shellSafe("pm list packages -s"),
+        webAdb.listPackages("user"),
+        webAdb.listPackages("system"),
       ]);
       const { userApps, systemApps } = parsePackageList(userOut, sysOut);
       set({ userApps, systemApps, appsLoading: false });
@@ -387,14 +542,26 @@ export const useStore = create<DexPortState>((set, get) => ({
 
   refreshTelemetry: async () => {
     try {
-      const [batteryOut, mediaOut] = await Promise.all([
-        webAdb.shellSafe("dumpsys battery"),
-        webAdb.shellSafe("dumpsys media_session"),
-      ]);
+      const { battery, mediaSessions, volumes } = await pollTelemetryBatch();
       set({
-        battery: parseBattery(batteryOut),
-        mediaSessions: parseMediaSessions(mediaOut).slice(0, 3),
+        battery,
+        mediaSessions,
+        ...(volumes ? { volume: volumes.music / Math.max(1, volumes.musicMax) } : {}),
       });
+    } catch {
+      /* noop — el próximo tick reintenta */
+    }
+  },
+
+  refreshRunningApps: async () => {
+    const displayId = get().displayId;
+    try {
+      const out = await webAdb.shellSafe(
+        "timeout 3 dumpsys activity activities 2>/dev/null | grep -E '^(Display #)|(Task\\{)' | head -80",
+        10_000,
+      );
+      const running = parseRunningApps(out, displayId && displayId > 0 ? displayId : null);
+      set({ runningApps: running });
     } catch {
       /* noop */
     }
@@ -411,11 +578,25 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   goHome: () => {
+    get().launchHome();
+  },
+
+  /**
+   * v2: envía un keycode con triple estrategia:
+   * 1) canal de control scrcpy (instantáneo)
+   * 2) input keyevent por shell (lento pero seguro)
+   * 3) toast de error visible si nada funciona
+   */
+  sendKeyAction: (keycode) => {
     const controller = displayEngine.controller;
-    controller
-      ?.injectKeyCode({ action: 0, keyCode: 3, repeat: 0, metaState: 0 })
-      .then(() => controller.injectKeyCode({ action: 1, keyCode: 3, repeat: 0, metaState: 0 }))
-      .catch(() => undefined);
+    if (controller) {
+      controller
+        .injectKeyCode({ action: 0, keyCode: keycode as never, repeat: 0, metaState: 0 as never })
+        .then(() => controller.injectKeyCode({ action: 1, keyCode: keycode as never, repeat: 0, metaState: 0 as never }))
+        .catch(() => webAdb.inputKeyevent(keycode));
+    } else {
+      void webAdb.inputKeyevent(keycode);
+    }
   },
 
   // ═════════════════════════════════════════════════════════
@@ -430,11 +611,12 @@ export const useStore = create<DexPortState>((set, get) => ({
       await displayEngine.stop();
       const authorized = await webAdb.getAuthorizedDevices();
       const device = authorized.find((d) => d.serial === get().deviceInfo?.serial) ?? authorized[0];
-      if (!device || !webAdb.adb) throw new Error("sin dispositivo");
+      if (!device && !webAdb.adb) throw new Error("sin dispositivo");
 
       // Si la conexión ADB sigue viva, reutilizamos
       let adb = webAdb.adb;
       if (!adb) {
+        if (!device) throw new Error("sin dispositivo");
         set({ reconnectMessage: "Re-autenticando dispositivo…" });
         adb = await webAdb.connect(device);
       }
@@ -479,6 +661,7 @@ export const useStore = create<DexPortState>((set, get) => ({
 
   shutdown: async () => {
     stopTelemetryLoop();
+    stopAppMonitorLoop();
     await displayEngine.stop();
     await webAdb.disconnect();
     set({
@@ -493,6 +676,11 @@ export const useStore = create<DexPortState>((set, get) => ({
       mediaSessions: [],
       userApps: [],
       systemApps: [],
+      runningApps: [],
+      displayId: null,
+      controlOnline: false,
+      mirrorMode: false,
+      launcherPkg: null,
       panels: {
         drawerOpen: false,
         mediaOpen: false,
@@ -513,9 +701,8 @@ function sleep(ms: number): Promise<void> {
 function waitFor(
   predicate: () => boolean,
   timeoutMs: number,
-  timeoutMsg: string,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const t0 = Date.now();
     const interval = setInterval(() => {
       if (predicate()) {
@@ -525,7 +712,6 @@ function waitFor(
         clearInterval(interval);
         // No bloqueamos el boot si el video tarda pero ya arrancó
         resolve();
-        void timeoutMsg;
       }
     }, 200);
   });
@@ -545,6 +731,24 @@ function stopTelemetryLoop(): void {
   if (telemetryTimer) {
     clearInterval(telemetryTimer);
     telemetryTimer = null;
+  }
+}
+
+/** v2: AppMonitor port — apps visibles en el display virtual cada 4s */
+function startAppMonitorLoop(): void {
+  stopAppMonitorLoop();
+  appMonitorTimer = setInterval(() => {
+    const s = useStore.getState();
+    if (s.phase === "desktop" && !s.reconnecting && s.displayId != null) {
+      void s.refreshRunningApps();
+    }
+  }, 4000);
+}
+
+function stopAppMonitorLoop(): void {
+  if (appMonitorTimer) {
+    clearInterval(appMonitorTimer);
+    appMonitorTimer = null;
   }
 }
 

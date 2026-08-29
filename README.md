@@ -9,6 +9,11 @@ teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
 > 🔗 **Demo en vivo:** <https://dexport-app.vercel.app>
 
+> 🚀 **v2** — rebuild con ingeniería inversa del build original (AndroidDex v1.2):
+> launcher del teléfono en el escritorio virtual, lanzamiento de apps reales
+> (`am start --display` / START_APP de scrcpy 3.3), boot no bloqueante,
+> monitor de apps en ejecución y audio funcional.
+
 ---
 
 ## Cómo funciona

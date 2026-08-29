@@ -31,9 +31,10 @@ import {
   RotateCcw,
   Power,
   Trash2,
+  Grid2x2,
 } from "lucide-react";
-import { displayEngine, useStore } from "../store/store";
-import { QUICK_KEYS, sendKeycode } from "../utils/androidKeys";
+import { useStore } from "../store/store";
+import { QUICK_KEYS } from "../utils/androidKeys";
 import { readDeviceFlags, type DeviceFlags } from "../utils/telemetry";
 import { useEffect, useState } from "react";
 
@@ -81,15 +82,13 @@ export function MediaPanel() {
   const sessions = useStore((s) => s.mediaSessions);
   const refreshTelemetry = useStore((s) => s.refreshTelemetry);
   const toast = useStore((s) => s.toast);
+  const sendKeyAction = useStore((s) => s.sendKeyAction);
 
   if (!open) return null;
 
   const sendKey = (key: number) => {
-    const c = displayEngine.controller;
-    if (!c) return;
-    void sendKeycode(c, key)
-      .then(() => refreshTelemetry())
-      .catch(() => undefined);
+    sendKeyAction(key);
+    void refreshTelemetry();
   };
 
   return (
@@ -174,6 +173,12 @@ export function DevicePanel() {
   const togglePanel = useStore((s) => s.togglePanel);
   const deviceInfo = useStore((s) => s.deviceInfo);
   const battery = useStore((s) => s.battery);
+  const displayId = useStore((s) => s.displayId);
+  const controlOnline = useStore((s) => s.controlOnline);
+  const mirrorMode = useStore((s) => s.mirrorMode);
+  const launcherPkg = useStore((s) => s.launcherPkg);
+  const runningApps = useStore((s) => s.runningApps);
+  const launchHome = useStore((s) => s.launchHome);
   const [flags, setFlags] = useState<DeviceFlags | null>(null);
 
   useEffect(() => {
@@ -211,6 +216,26 @@ export function DevicePanel() {
     >
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
         <Stat
+          icon={<Monitor size={18} />}
+          label="Display virtual"
+          value={mirrorMode ? "Espejo (fallback)" : displayId != null ? `#${displayId} activo` : "Creando…"}
+        />
+        <Stat
+          icon={<Activity size={18} />}
+          label="Canal de control"
+          value={controlOnline ? "Activo (scrcpy)" : "Vía shell (lento)"}
+        />
+        <Stat
+          icon={<Smartphone size={18} />}
+          label="Launcher"
+          value={launcherPkg ?? "—"}
+        />
+        <Stat
+          icon={<Grid2x2 size={18} />}
+          label="Apps visibles"
+          value={`${runningApps.length} en el escritorio`}
+        />
+        <Stat
           icon={battery?.charging ? <BatteryCharging size={18} /> : <Battery size={18} />}
           label="Batería"
           value={battery ? `${battery.percentage}%${battery.charging ? " · cargando" : ""}` : "—"}
@@ -227,7 +252,7 @@ export function DevicePanel() {
         />
         <Stat
           icon={<Activity size={18} />}
-          label=" Salud de batería"
+          label="Salud de batería"
           value={battery?.health ?? "—"}
         />
         <Stat
@@ -240,6 +265,15 @@ export function DevicePanel() {
           label="Tecnología"
           value={battery?.technology ?? "—"}
         />
+      </div>
+
+      <div className="mt-4">
+        <button
+          className="btn-primary w-full"
+          onClick={() => void launchHome()}
+        >
+          Relanzar launcher en el escritorio
+        </button>
       </div>
 
       <h3 className="mb-3 mt-6 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">

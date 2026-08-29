@@ -29,7 +29,8 @@ import {
   Info,
 } from "lucide-react";
 import { displayEngine, useStore } from "../store/store";
-import { QUICK_KEYS, sendKeycode } from "../utils/androidKeys";
+import { webAdb } from "../services/adb";
+import { QUICK_KEYS } from "../utils/androidKeys";
 
 function Clock() {
   const [now, setNow] = useState(new Date());
@@ -56,7 +57,15 @@ function Clock() {
 
 function BatteryIndicator() {
   const battery = useStore((s) => s.battery);
-  if (!battery) return null;
+  // v2: sin datos → no mostrar (v1 mostraba "0%" engañoso)
+  if (!battery) {
+    return (
+      <div className="flex items-center gap-1 text-[#9499a3]" title="Telemetría no disponible aún">
+        <Battery size={16} />
+        <span className="text-[12px] font-medium">—</span>
+      </div>
+    );
+  }
   const Icon = battery.charging
     ? BatteryCharging
     : battery.percentage >= 95
@@ -73,13 +82,11 @@ function BatteryIndicator() {
 function MiniMediaPlayer() {
   const mediaSessions = useStore((s) => s.mediaSessions);
   const togglePanel = useStore((s) => s.togglePanel);
+  const sendKeyAction = useStore((s) => s.sendKeyAction);
   const session = mediaSessions.find((s) => s.active) ?? mediaSessions[0];
 
-  const sendKey = (key: number, updown = true) => {
-    const c = displayEngine.controller;
-    if (!c) return;
-    void sendKeycode(c, key).catch(() => undefined);
-    void updown;
+  const sendKey = (key: number) => {
+    sendKeyAction(key);
   };
 
   return (
@@ -141,15 +148,23 @@ export function Taskbar() {
   const audioMuted = useStore((s) => s.audioMuted);
   const setAudioMuted = useStore((s) => s.setAudioMuted);
   const settings = useStore((s) => s.settings);
+  const sendKeyAction = useStore((s) => s.sendKeyAction);
+  const launchHome = useStore((s) => s.launchHome);
+  const controlOnline = useStore((s) => s.controlOnline);
+  const displayId = useStore((s) => s.displayId);
+  const runningApps = useStore((s) => s.runningApps);
 
   const sendKey = (key: number) => {
-    const c = displayEngine.controller;
-    if (!c) return;
-    void sendKeycode(c, key).catch(() => undefined);
+    sendKeyAction(key);
   };
 
   const openNotifications = () => {
-    displayEngine.controller?.expandNotificationPanel().catch(() => undefined);
+    const c = displayEngine.controller;
+    if (c) {
+      c.expandNotificationPanel().catch(() => undefined);
+    } else {
+      void webAdb.inputKeyevent(QUICK_KEYS.notification);
+    }
   };
 
   return (
@@ -158,8 +173,8 @@ export function Taskbar() {
       <div className="flex items-center gap-1">
         <button
           className="taskbar-btn"
-          title="Inicio (Home)"
-          onClick={() => sendKey(QUICK_KEYS.home)}
+          title="Inicio — abre el launcher del teléfono en el escritorio"
+          onClick={() => void launchHome()}
         >
           <Home size={19} />
         </button>
@@ -184,6 +199,15 @@ export function Taskbar() {
         >
           <Info size={18} />
         </button>
+        {/* v2: indicador de estado del canal de control */}
+        <div
+          className={`ml-1 h-2 w-2 rounded-full ${controlOnline ? "bg-[#3ddc84]" : "bg-[#f59e0b] pulse-glow"}`}
+          title={
+            controlOnline
+              ? `Control activo (mouse/teclado) · ${runningApps.length} app(s) visible(s)${displayId != null ? ` · Display #${displayId}` : ""}`
+              : "Canal de control no disponible — los botones usan comandos shell (más lentos)"
+          }
+        />
       </div>
 
       <div className="mx-1 h-8 w-px bg-white/10" />
@@ -232,7 +256,7 @@ export function Taskbar() {
 
         <button
           className="flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-[11px] text-[#9499a3] transition hover:bg-white/10 hover:text-white"
-          title={`${deviceInfo?.name ?? ""} · Android ${deviceInfo?.androidVersion ?? ""} · ${settings.virtualDisplay ? `Display virtual ${settings.width}×${settings.height}` : "Espejo de pantalla"}`}
+          title={`${deviceInfo?.name ?? ""} · Android ${deviceInfo?.androidVersion ?? ""} · ${settings.virtualDisplay ? `Display virtual ${settings.width}×${settings.height}${displayId != null ? ` (#${displayId})` : ""}` : "Espejo de pantalla"}`}
           onClick={() => togglePanel("deviceOpen")}
         >
           <MonitorSmartphone size={15} />
