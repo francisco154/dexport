@@ -1,0 +1,36 @@
+{
+  "name": "dexport",
+  "private": true,
+  "version": "1.0.0",
+  "description": "DexPort — Android DEX reimagined for the browser. Turn your Android phone into a full desktop experience using WebADB (WebUSB) + scrcpy virtual displays. Port of Android-Dex (github.com/Shrey113/Android-Dex).",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@yume-chan/adb": "^2.6.3",
+    "@yume-chan/adb-credential-web": "^2.1.0",
+    "@yume-chan/adb-daemon-webusb": "^2.3.2",
+    "@yume-chan/adb-scrcpy": "^2.3.2",
+    "@yume-chan/scrcpy": "^2.3.0",
+    "@yume-chan/scrcpy-decoder-webcodecs": "^2.5.3",
+    "@yume-chan/scrcpy-decoder-tinyh264": "^2.1.0",
+    "@yume-chan/stream-extra": "^2.6.1",
+    "@yume-chan/event": "^2.0.0",
+    "lucide-react": "^0.545.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.18",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "tailwindcss": "^4.1.18",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.0"
+  }
+}
