@@ -339,7 +339,7 @@ export function Taskbar() {
       <div className="flex items-center gap-1">
         <button
           className="taskbar-btn"
-          title="Inicio — launcher predefinido del teléfono (siempre el mismo)"
+          title="Inicio — launcher del escritorio (display virtual)"
           onClick={() => void goHomeSmart()}
         >
           <Home size={19} />

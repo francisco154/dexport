@@ -990,9 +990,18 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v4→v9: HOME del escritorio. v9: el PREDETERMINADO del teléfono manda
-   * (resuelto por el agente); el original (companion) solo si el usuario
-   * lo eligió explícitamente en el selector.
+   * v10.1: HOME del escritorio — prioridad v8 REPARADA:
+   *   1. el launcher ELEGIDO por el usuario (persistido)
+   *   2. el launcher ORIGINAL (companion) si está instalado
+   *   3. un launcher del teléfono que NO sea el predefinido (su tarea
+   *      no vive en el display 0 → puede crearse en el display virtual)
+   *   4. el PREDETERMINADO — último recurso, con el protocolo robusto
+   *      (force-stop + verificación; en muchos teléfonos el sistema lo
+   *      revive en el display 0, pero es la última opción, no la primera)
+   *
+   * (La v9 ponía el predefinido el PRIMERO — regresión del launcher en
+   * la pantalla principal. `resolveHomeLauncher` se mantiene SOLO como
+   * información para el panel/selector, no decide el HOME.)
    */
   launchHome: async () => {
     const displayId = get().displayId;
@@ -1002,27 +1011,24 @@ export const useStore = create<DexPortState>((set, get) => ({
       return;
     }
 
-    // v9: prioridad — predefinido del teléfono → elegido → original
     const selected = get().selectedLauncherComponent;
-    const isExplicitCompanion = selected?.startsWith(COMPANION_PKG) === true;
-    const preferred =
-      (await get().resolveHomeLauncher()) ??
-      (selected && !isExplicitCompanion
-        ? selected
-        : null) ??
-      // sin elección previa: el original si está instalado
-      (get().companionInstalled ? COMPANION_MAIN_ACTIVITY : null);
+    const launchers = get().launchers;
+    const notDefault = launchers.find(
+      (l) => !l.isDefault && l.component !== selected,
+    );
+    const fallbackDefault = launchers.find((l) => l.isDefault);
+    const candidates = (
+      [
+        selected,
+        get().companionInstalled ? COMPANION_MAIN_ACTIVITY : null,
+        notDefault?.component ?? null,
+        fallbackDefault?.component ?? null,
+      ] as (string | null)[]
+    ).filter((c): c is string => !!c);
 
-    if (preferred) {
-      const ok = await get().selectLauncher(preferred);
+    for (const component of candidates) {
+      const ok = await get().selectLauncher(component);
       if (ok) return;
-    } else {
-      // sin selección posible → intentar el protocolo genérico HOME
-      const anyLauncher = get().launchers[0];
-      if (anyLauncher) {
-        const ok = await get().selectLauncher(anyLauncher.component);
-        if (ok) return;
-      }
     }
 
     get().toast("No se pudo abrir el launcher — elige uno en el selector", "error");
@@ -1809,17 +1815,25 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v9: HOME DETERMINISTA — siempre al MISMO sitio: el launcher
-   * PREDETERMINADO del teléfono (resuelto por el DexPort Agent o por
-   * `cmd package resolve-activity`, cacheado en defaultLauncherComponent).
+   * v10.1: HOME del escritorio — REPARADO (regresión v9).
    *
+   * La v9 apuntaba el HOME al launcher PREDETERMINADO del teléfono
+   * (p.ej. Samsung One UI Home): la tarea de ese launcher vive SIEMPRE en
+   * el display 0 y `am start --display N` NO mueve tareas existentes —
+   * solo trae la tarea al frente EN EL TELÉFONO. Resultado: el launcher
+   * se abría en la pantalla principal, el display virtual quedaba en
+   * negro («display fallando») y sin tareas en el vd la taskbar no
+   * listaba nada («no lee las apps abiertas») — los 3 síntomas.
+   *
+   * v10.1 vuelve al objetivo de la v8 (que funcionaba):
+   *   · el launcher ELEGIDO (persistido) u el ORIGINAL (companion),
+   *     cuya tarea NO existe en el display 0 → `am start --display N`
+   *     la crea EN el display virtual
    * Estrategia:
-   *   1. `am start -n <predefinido> --display <vd>` — crea/mueve la tarea
-   *      del launcher al display virtual (determinista, el mismo launcher
-   *      SIEMPRE; ya no el companion ni el primero de la lista)
-   *   2. keyevent HOME dirigido al vd — afianza (lo trae al frente si ya
-   *      estaba en el display)
-   *   3. verificación diferida: si el display sigue sin contenido →
+   *   a) si el vd está VACÍO → relanzamiento silencioso del objetivo
+   *      directo al display virtual (am start --display vd -n <comp>)
+   *   b) HOME del sistema sobre el vd (lo trae al frente al instante)
+   *   c) verificación diferida: si el vd sigue sin contenido →
    *      protocolo robusto completo (launchHome) como red de seguridad
    */
   goHomeSmart: async () => {
@@ -1829,20 +1843,19 @@ export const useStore = create<DexPortState>((set, get) => ({
       return;
     }
 
-    // ── 1+2: launcher predefinido, explícito ──
-    const target =
-      (await get().resolveHomeLauncher()) ?? get().selectedLauncherComponent;
-    if (target) {
-      const started = await webAdb.startActivityOnDisplay(target, vd);
-      // afianzar con el HOME del sistema sobre el display virtual
-      await webAdb.inputKeyeventOnDisplay(3, vd).catch(() => false);
-      if (started) {
-        setTimeout(() => void useStore.getState().refreshRunningApps(), 900);
-        return;
+    // ── a) vd vacío → sembrar el launcher ELEGIDO/ORIGINAL en el vd ──
+    //    (nunca el predefinido del teléfono: su tarea vive en el display 0)
+    const hasTaskNow = get().runningApps.some((t) => t.displayId === vd);
+    if (!hasTaskNow) {
+      const selected = get().selectedLauncherComponent;
+      const seed =
+        selected ?? (get().companionInstalled ? COMPANION_MAIN_ACTIVITY : null);
+      if (seed) {
+        await quietRelaunchOnDisplay(seed, vd).catch(() => false);
       }
     }
 
-    // ── 3: fallback v7 — keyevent + verificación con protocolo completo ──
+    // ── b+c) keyevent HOME al vd + verificación diferida (flujo v8) ──
     const before = get().runningApps.some((t) => t.displayId === vd);
     await get().sendNavKey(3);
     setTimeout(async () => {

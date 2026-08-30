@@ -367,7 +367,7 @@ export function DevicePanel() {
 /**
  * v8→v9: sección del DexPort Agent — estado + instalación + explicación.
  * v2: detección EXACTA de apps/ventanas + íconos y nombres reales +
- * espejo de notificaciones + launcher predefinido (HOME determinista).
+ * espejo de notificaciones + info del launcher predefinido del teléfono.
  */
 function AgentSettingsSection() {
   const agentStatus = useStore((s) => s.agentStatus);
@@ -454,7 +454,7 @@ function AgentSettingsSection() {
                 : "⚠ notificaciones sin permiso"}
             </span>
             <span className="rounded-full bg-white/6 px-2.5 py-1 text-[#c3c9d4]">
-              ✓ HOME al launcher predefinido
+              ✓ HOME al launcher del escritorio
             </span>
             <span
               className={`rounded-full px-2.5 py-1 ${
@@ -476,7 +476,8 @@ function AgentSettingsSection() {
           ambas pantallas (título, actividad y foco por display), los íconos y
           nombres reales de TODAS las apps instaladas, las notificaciones activas
           del teléfono (centro de notificaciones del escritorio) y el launcher
-          predefinido para que HOME lleve siempre al mismo sitio. v3
+          predefinido del teléfono — informativo, para elegirlo en el selector
+          si lo prefieres para el escritorio. v3
           reconstruido para no frenar NUNCA el teléfono: servicio de
           accesibilidad ultraligero, todo el trabajo pesado en un hilo de fondo
           y solo en el perfil principal (sin duplicados en Island). Se instala
