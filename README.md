@@ -9,6 +9,27 @@ teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
 > 🔗 **Demo en vivo:** <https://dexport-mu.vercel.app>
 
+> 🚀 **v9** — **DexPort Agent v2: íconos reales + notificaciones + HOME fijo**:
+> · **Íconos y nombres GENUINOS** — el agente ahora entrega el ícono real
+>   (PNG 64px, drawable del launcher) y la etiqueta exacta del
+>   PackageManager de cada app, por lotes y con caché en localStorage: el
+>   app drawer, la franja de tareas, «Apps abiertas» y los controles de
+>   ventana muestran los íconos originales (adiós al avatar con la inicial).
+> · **Centro de notificaciones** (la nueva utilidad del agente) —
+>   NotificationListenerService espeja las notificaciones activas del
+>   teléfono al escritorio: panel lateral estilo action center con ícono de
+>   la app, título, texto y hora; descartar una a una o «limpiar todo»,
+>   toasts de las nuevas y clic = abrir la app. El permiso se concede por
+>   ADB (`cmd notification allow_listener`), sin tocar el teléfono.
+> · **HOME determinista** — el botón Inicio lanza SIEMPRE el launcher
+>   PREDETERMINADO del teléfono (resuelto por el agente vía
+>   `PackageManager.resolveActivity(HOME)`): mismo sitio siempre, en el
+>   display virtual, con verificación y auto-reparación de respaldo.
+> · **Componente exacto por app** — el agente da el
+>   `pkg/Activity` lanzable real: arranque directo con `am start -n`
+>   (adiós `monkey`) y nombres reales en toda la UI.
+> · El agente v1 se **auto-actualiza solo** a v2 por ADB al reconectar.
+
 > 🚀 **v8** — **DexPort Agent + escritorio estilo Windows real**:
 > · **Taskbar flotante y ocultable** — la barra ahora flota sobre el
 >   escritorio (DeX style) con un botón de **minimizar** que la convierte en

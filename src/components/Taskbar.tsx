@@ -35,8 +35,7 @@ import {
   X,
   LayoutGrid,
 } from "lucide-react";
-import { displayEngine, useStore } from "../store/store";
-import { webAdb } from "../services/adb";
+import { useStore } from "../store/store";
 import { QUICK_KEYS } from "../utils/androidKeys";
 import { appColor, appInitial, type AppEntry } from "../utils/appNames";
 import type { TaskInfo } from "../utils/telemetry";
@@ -320,18 +319,17 @@ export function Taskbar() {
   const showTaskbarNav = useStore((s) => s.uiPrefs.showTaskbarNav);
   const agentStatus = useStore((s) => s.agentStatus);
   const setUiPrefs = useStore((s) => s.setUiPrefs);
+  // v9: notificaciones espejadas (badge del botón)
+  const notifications = useStore((s) => s.notifications);
+  const notifCount = notifications.length;
 
   const sendKey = (key: number) => {
     sendKeyAction(key);
   };
 
   const openNotifications = () => {
-    const c = displayEngine.controller;
-    if (c) {
-      c.expandNotificationPanel().catch(() => undefined);
-    } else {
-      void webAdb.inputKeyevent(QUICK_KEYS.notification);
-    }
+    // v9: nuestro propio centro de notificaciones (espejo del teléfono)
+    togglePanel("notificationsOpen");
   };
 
   return (
@@ -341,7 +339,7 @@ export function Taskbar() {
       <div className="flex items-center gap-1">
         <button
           className="taskbar-btn"
-          title="Inicio — launcher del escritorio (instantáneo)"
+          title="Inicio — launcher predefinido del teléfono (siempre el mismo)"
           onClick={() => void goHomeSmart()}
         >
           <Home size={19} />
@@ -361,11 +359,16 @@ export function Taskbar() {
           <ChevronUp size={19} />
         </button>
         <button
-          className="taskbar-btn"
-          title="Panel de notificaciones"
+          className={`taskbar-btn relative ${panels.notificationsOpen ? "bg-white/12 text-white" : ""}`}
+          title={notifCount > 0 ? `Centro de notificaciones — ${notifCount} activa(s)` : "Centro de notificaciones"}
           onClick={openNotifications}
         >
           <Info size={18} />
+          {notifCount > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 grid h-4 min-w-4 place-items-center rounded-full bg-[#38bdf8] px-1 text-[9px] font-bold text-[#04121f]">
+              {notifCount > 99 ? "99+" : notifCount}
+            </span>
+          )}
         </button>
         {/* indicador de estado del canal de control + agente */}
         <div

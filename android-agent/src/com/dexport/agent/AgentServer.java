@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService;
 import android.os.Build;
 import android.util.Log;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -13,13 +14,15 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /**
- * DexPort Agent — servidor TCP (localhost:8458).
+ * DexPort Agent v2 — servidor TCP (localhost:8458).
  * ════════════════════════════════════════════════════════════
  * Mismo protocolo de líneas JSON que el companion original (8457):
  *   request :  {"type": "<cmd>", "id": "<n>"}\n
@@ -27,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  * Una conexión por request (handleClient serializado por conexión).
  * La web llega por adb.createSocket("tcp:8458").
  *
- * Comandos:
+ * Comandos v1 (detección — funcionando):
  *   ping                → version / sdk / device
  *   tasks.get_all       → apps abiertas (ventanas TYPE_APPLICATION de todos
  *                         los displays) con actividad, título, foco y capa
@@ -36,6 +39,18 @@ import java.util.concurrent.TimeUnit;
  *   foreground.get      → ventana activa global + nº de ventanas por display
  *   action.back|home|recents|notifications|quick_settings|lock_screen|all_apps
  *                       → performGlobalAction (devuelve performed=true/false)
+ *
+ * Comandos v2 (lo que faltaba):
+ *   apps.get            → apps lanzables con ETIQUETAS REALES y componente
+ *                         exacto (am start -n directo, sin monkey)
+ *   icons.get           → lote de íconos PNG base64 por paquetes
+ *                         {"packages": ["com.x", "com.y"]}
+ *   launcher.get        → launcher PREDETERMINADO del teléfono + todos los
+ *                         HOME instalados (HOME determinista en la web)
+ *   notifications.get   → notificaciones activas espejadas (app, ícono,
+ *                         título, texto, ongoing, clearable)
+ *   notification.dismiss {"key": "…"} → descartar desde la web
+ *   notifications.clear_all → limpiar las descartables
  */
 public class AgentServer extends Thread {
 
@@ -118,7 +133,7 @@ public class AgentServer extends Thread {
 
     private void handle(Socket client) {
         try {
-            client.setSoTimeout(10_000);
+            client.setSoTimeout(20_000);
             BufferedReader in = new BufferedReader(
                     new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
             String line = in.readLine();
@@ -159,11 +174,53 @@ public class AgentServer extends Thread {
             switch (cmd == null ? "" : cmd) {
                 case "ping": {
                     res.put("service", "DexPort Agent");
-                    res.put("version", 1);
+                    res.put("version", 2);
                     res.put("sdk", Build.VERSION.SDK_INT);
                     res.put("android", Build.VERSION.RELEASE);
                     res.put("device", Build.MANUFACTURER + " " + Build.MODEL);
                     res.put("multi_display", Build.VERSION.SDK_INT >= 33);
+                    res.put("notifications", AgentNotificationListener.isConnected());
+                    break;
+                }
+                case "apps.get": {
+                    res.put("apps", AppRegistry.get(service).appsJson());
+                    break;
+                }
+                case "icons.get": {
+                    List<String> pkgs = new ArrayList<>();
+                    JSONArray arr = req.optJSONArray("packages");
+                    if (arr != null) {
+                        for (int i = 0; i < arr.length() && i < 16; i++) {
+                            String p = arr.optString(i, "");
+                            if (!p.isEmpty()) {
+                                pkgs.add(p);
+                            }
+                        }
+                    }
+                    res.put("icons", AppRegistry.get(service).iconsJson(pkgs));
+                    break;
+                }
+                case "launcher.get": {
+                    res.put("launcher", AppRegistry.get(service).launcherJson());
+                    break;
+                }
+                case "notifications.get": {
+                    res.put("notifications", AgentNotificationListener.snapshotJson(service));
+                    break;
+                }
+                case "notification.dismiss": {
+                    String key = req.optString("key", "");
+                    boolean ok = AgentNotificationListener.dismiss(key);
+                    res.put("performed", ok);
+                    if (!ok) {
+                        res.put("status", "error");
+                        res.put("error", "no se pudo descartar (¿listener activo?)");
+                    }
+                    break;
+                }
+                case "notifications.clear_all": {
+                    boolean ok = AgentNotificationListener.clearAll();
+                    res.put("performed", ok);
                     break;
                 }
                 case "tasks.get_all": {

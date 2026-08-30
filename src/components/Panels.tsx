@@ -365,8 +365,9 @@ export function DevicePanel() {
 /** ── Ajustes del display virtual (v6: pantalla, personalización, calidad) ── */
 
 /**
- * v8: sección del DexPort Agent — estado + instalación + explicación.
- * El agente da la detección EXACTA de apps/ventanas y acciones fiables.
+ * v8→v9: sección del DexPort Agent — estado + instalación + explicación.
+ * v2: detección EXACTA de apps/ventanas + íconos y nombres reales +
+ * espejo de notificaciones + launcher predefinido (HOME determinista).
  */
 function AgentSettingsSection() {
   const agentStatus = useStore((s) => s.agentStatus);
@@ -374,6 +375,8 @@ function AgentSettingsSection() {
   const agentInstall = useStore((s) => s.agentInstall);
   const installAgent = useStore((s) => s.installAgent);
   const checkAgent = useStore((s) => s.checkAgent);
+  const notifListenerEnabled = useStore((s) => s.notifListenerEnabled);
+  const notifications = useStore((s) => s.notifications);
 
   const busy =
     agentInstall.phase === "downloading" || agentInstall.phase === "pushing" ||
@@ -399,7 +402,7 @@ function AgentSettingsSection() {
     <>
       <h3 className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         <Radar size={13} className="text-sky-300/70" />
-        DexPort Agent · detección de ventanas
+        DexPort Agent v2 · detección + íconos + notificaciones
       </h3>
       <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-sky-400/15 bg-sky-400/5 p-4">
         <div className="flex items-center justify-between gap-3">
@@ -409,7 +412,7 @@ function AgentSettingsSection() {
             </p>
             <p className={`text-[11.5px] ${statusColor[agentStatus] ?? "text-[#9499a3]"}`}>
               {agentStatus === "connected" && agentPing
-                ? `Activo · Android ${agentPing.android} (${agentPing.device})`
+                ? `Activo v${agentPing.version} · Android ${agentPing.android} (${agentPing.device})`
                 : statusLabel[agentStatus] ?? agentStatus}
             </p>
           </div>
@@ -425,22 +428,58 @@ function AgentSettingsSection() {
           ) : (
             <button className="btn-solid !py-2 !text-[12px]" onClick={() => void installAgent()}>
               <Download size={12} />
-              {agentStatus === "missing" ? "Instalar (45 KB)" : "Activar"}
+              {agentStatus === "missing" ? "Instalar (50 KB)" : "Activar"}
             </button>
           )}
         </div>
 
+        {/* v9: capacidades activas */}
+        {agentStatus === "connected" && (
+          <div className="flex flex-wrap gap-1.5 text-[10.5px]">
+            <span className="rounded-full bg-[#3ddc84]/12 px-2.5 py-1 text-[#3ddc84]">
+              ✓ apps y ventanas en vivo
+            </span>
+            <span className="rounded-full bg-[#38bdf8]/12 px-2.5 py-1 text-[#7dd3fc]">
+              ✓ íconos y nombres reales
+            </span>
+            <span
+              className={`rounded-full px-2.5 py-1 ${
+                notifListenerEnabled
+                  ? "bg-[#38bdf8]/12 text-[#7dd3fc]"
+                  : "bg-[#f59e0b]/12 text-[#fbbf24]"
+              }`}
+            >
+              {notifListenerEnabled
+                ? `✓ notificaciones espejadas (${notifications.length})`
+                : "⚠ notificaciones sin permiso"}
+            </span>
+            <span className="rounded-full bg-white/6 px-2.5 py-1 text-[#c3c9d4]">
+              ✓ HOME al launcher predefinido
+            </span>
+          </div>
+        )}
+
         <p className="text-[11.5px] leading-relaxed text-[#aab3bf]">
           El agente mapea lo que ADB no puede ver: apps y ventanas abiertas en
-          ambas pantallas (título, actividad y foco por display) y ejecuta
-          Atrás/Inicio/Recientes de forma fiable. Se instala y recibe permisos
-          por ADB — sin tocar el teléfono. Todo queda en tu dispositivo (USB).
+          ambas pantallas (título, actividad y foco por display), los íconos y
+          nombres reales de las apps, las notificaciones activas del teléfono
+          (centro de notificaciones del escritorio) y el launcher predefinido
+          para que HOME lleve siempre al mismo sitio. Se instala y recibe todos
+          sus permisos por ADB — sin tocar el teléfono. Todo queda en tu
+          dispositivo (USB).
         </p>
         {agentStatus === "no-permission" && (
           <p className="rounded-xl bg-amber-400/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
             Si «Activar» no lo conecta, abre en el teléfono: Ajustes →
             Accesibilidad → DexPort Agent → activar. (Algunas ROMs lo piden
             manualmente la primera vez.)
+          </p>
+        )}
+        {agentStatus === "connected" && !notifListenerEnabled && (
+          <p className="rounded-xl bg-amber-400/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
+            El espejo de notificaciones no quedó activo en esta ROM. Pulsa
+            «Activar» (reinstala y re-pide los permisos por ADB) o actívalo en
+            Ajustes → Acceso a notificaciones → DexPort Agent · Notificaciones.
           </p>
         )}
         {agentStatus !== "connected" && !busy && (

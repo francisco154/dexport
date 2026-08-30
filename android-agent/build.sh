@@ -11,11 +11,18 @@ cd "$(dirname "$0")"
 SDK="${ANDROID_SDK:-/home/z/android-sdk}"
 BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
-JAVA_BIN="${JAVA_HOME:+$JAVA_HOME/bin}"
-# JDK local (Temurin) si no hay javac en PATH
-if ! command -v javac >/dev/null 2>&1; then
-  export PATH="/home/z/jdk/bin:$PATH"
+# JDK local (Temurin) si no hay JAVA_HOME ni javac en PATH
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ]; then
+  JAVA_BIN="$JAVA_HOME/bin/"
+  export PATH="$JAVA_HOME/bin:$PATH"
+elif command -v javac >/dev/null 2>&1; then
+  JAVA_BIN=""
+elif [ -x /home/z/jdk/bin/javac ]; then
   JAVA_BIN="/home/z/jdk/bin/"
+  export PATH="/home/z/jdk/bin:$PATH"
+else
+  echo "ERROR: no se encontró javac (instala JDK 17+ o define JAVA_HOME)" >&2
+  exit 1
 fi
 
 echo "── 1/7  keystore (una sola vez)"
@@ -40,7 +47,7 @@ echo "── 3/7  aapt2 link (manifest + R.java)"
   --java build/gen \
   -R build/res.zip \
   --min-sdk-version 26 --target-sdk-version 34 \
-  --version-code 1 --version-name "1.0" \
+  --version-code 2 --version-name "1.1" \
   --auto-add-overlay
 
 echo "── 4/7  javac (Java 8 bytecode)"

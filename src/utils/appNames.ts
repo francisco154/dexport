@@ -13,6 +13,8 @@ export interface AppEntry {
   system: boolean;
   /** v3: ícono real (base64 PNG) proveniente del companion original */
   icon?: string | null;
+  /** v9: componente LAUNCHER exacto ("pkg/pkg.Activity") del DexPort Agent */
+  component?: string;
 }
 
 const POPULAR_APPS: Record<string, string> = {

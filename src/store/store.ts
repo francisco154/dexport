@@ -56,12 +56,14 @@ import {
   mergeTaskSources,
   parseCurrentFocus,
 } from "../utils/telemetry";
-import { parsePackageList, type AppEntry } from "../utils/appNames";
+import { parsePackageList, packageToLabel, type AppEntry } from "../utils/appNames";
 import {
   agentBridge,
   type AgentPing,
   type AgentInstallProgress,
   type AgentTask,
+  type AgentNotification,
+  type AgentAppInfo,
 } from "../services/agent";
 
 export type Phase = "landing" | "boot" | "desktop";
@@ -80,6 +82,8 @@ export interface PanelState {
   shortcutsOpen: boolean;
   /** v7: vista «Apps abiertas» (estilo Windows, botón Recientes) */
   taskViewOpen: boolean;
+  /** v9: centro de notificaciones (espejo del teléfono vía DexPort Agent) */
+  notificationsOpen: boolean;
 }
 
 /**
@@ -216,6 +220,16 @@ interface DexPortState {
   /** tareas crudas del agente (títulos reales de ventanas) */
   agentTasks: AgentTask[];
 
+  // ── v9: DexPort Agent v2 (apps reales + notificaciones) ──
+  /** apps reales sincronizadas (labels + componentes del PackageManager) */
+  agentAppsSynced: boolean;
+  /** notificaciones activas espejadas desde el teléfono */
+  notifications: AgentNotification[];
+  /** false → el listener no tiene permiso (se pidió por ADB pero la ROM lo negó) */
+  notifListenerEnabled: boolean;
+  /** launcher PREDETERMINADO del teléfono (HOME determinista) */
+  defaultLauncherComponent: string | null;
+
   // ── Panels ──
   panels: PanelState;
   toasts: { id: number; message: string; kind: "info" | "error" | "success" }[];
@@ -270,6 +284,18 @@ interface DexPortState {
   installAgent: () => Promise<void>;
   /** v8: acciones globales del agente (ATRÁS/HOME/… fiables) */
   agentAction: (a: "back" | "home" | "recents" | "notifications" | "quick_settings" | "lock_screen" | "all_apps") => Promise<boolean>;
+  /** v9: sincroniza apps reales (labels + componentes) e íconos por lotes */
+  syncAgentApps: () => Promise<void>;
+  /** v9: descarga los íconos que falten (lotes de 12, progresivo) */
+  syncAgentIcons: () => Promise<void>;
+  /** v9: refresca el espejo de notificaciones (con toasts de las nuevas) */
+  refreshNotifications: () => Promise<void>;
+  /** v9: descarta una notificación por key */
+  dismissNotification: (key: string) => Promise<void>;
+  /** v9: limpia todas las notificaciones descartables */
+  clearNotifications: () => Promise<void>;
+  /** v9: resuelve el launcher PREDETERMINADO (agente → shell → null) */
+  resolveHomeLauncher: () => Promise<string | null>;
   setAudioMuted: (m: boolean) => void;
   setVolume: (v: number) => void;
   goHome: () => void;
@@ -289,6 +315,66 @@ interface DexPortState {
 
 const SETTINGS_KEY = "dexport.settings.v1";
 const LAUNCHER_KEY = "dexport.launcher.v1";
+const ICONS_KEY = "dexport.icons.v1";
+
+// ═════════════════════════════════════════════════════════
+// v9: caché de íconos/labels reales (localStorage)
+// — el agente los entrega por lotes; se guardan para que el
+//   drawer/taskbar arranque con íconos reales al reconectar
+// ═════════════════════════════════════════════════════════
+interface IconCacheEntry {
+  label: string;
+  icon?: string;
+  component?: string;
+}
+const iconCache = new Map<string, IconCacheEntry>();
+try {
+  const raw = localStorage.getItem(ICONS_KEY);
+  if (raw) {
+    const obj = JSON.parse(raw) as Record<string, IconCacheEntry>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v.label === "string") iconCache.set(k, v);
+    }
+  }
+} catch {
+  /* caché corrupta → empezar vacía */
+}
+
+let iconCacheTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleIconCacheSave(): void {
+  if (iconCacheTimer) return;
+  iconCacheTimer = setTimeout(() => {
+    iconCacheTimer = null;
+    try {
+      const obj: Record<string, IconCacheEntry> = {};
+      // cap: 400 entradas (≈3 MB con íconos de 64px) para no reventar la cuota
+      const entries = [...iconCache.entries()].slice(-400);
+      for (const [k, v] of entries) obj[k] = v;
+      localStorage.setItem(ICONS_KEY, JSON.stringify(obj));
+    } catch {
+      try {
+        localStorage.removeItem(ICONS_KEY);
+      } catch {
+        /* noop */
+      }
+    }
+  }, 2_500);
+}
+
+/** Superpone labels/íconos/componentes cacheados sobre una lista de apps. */
+function overlayIconCache(list: AppEntry[]): AppEntry[] {
+  if (iconCache.size === 0) return list;
+  return list.map((e) => {
+    const c = iconCache.get(e.packageName);
+    if (!c) return e;
+    return {
+      ...e,
+      label: c.label || e.label,
+      ...(c.icon ? { icon: c.icon } : {}),
+      ...(c.component ? { component: c.component } : {}),
+    };
+  });
+}
 
 function loadLauncherPref(): string | null {
   try {
@@ -337,6 +423,13 @@ export const displayEngine = new DisplayEngine();
 
 let telemetryTimer: ReturnType<typeof setInterval> | null = null;
 let appMonitorTimer: ReturnType<typeof setInterval> | null = null;
+/** v9: guard de syncAgentIcons (una sola tanda de lotes a la vez) */
+let iconSyncBusy = false;
+/** v9: auto-actualización v1→v2 del agente — un intento por sesión */
+let agentUpgradeAttempted = false;
+/** v9: notificaciones ya vistas (para toasts solo de las NUEVAS) */
+const seenNotifKeys = new Set<string>();
+let notifFirstLoad = true;
 let toastSeq = 1;
 
 export const useStore = create<DexPortState>((set, get) => ({
@@ -390,6 +483,12 @@ export const useStore = create<DexPortState>((set, get) => ({
   agentInstall: { phase: "idle", progress: 0, message: "" },
   agentTasks: [],
 
+  // ── v9: agente v2 (apps reales + notificaciones + HOME determinista) ──
+  agentAppsSynced: false,
+  notifications: [],
+  notifListenerEnabled: false,
+  defaultLauncherComponent: null,
+
   panels: {
     drawerOpen: false,
     mediaOpen: false,
@@ -397,6 +496,7 @@ export const useStore = create<DexPortState>((set, get) => ({
     settingsOpen: false,
     shortcutsOpen: false,
     taskViewOpen: false,
+    notificationsOpen: false,
   },
   toasts: [],
 
@@ -747,27 +847,38 @@ export const useStore = create<DexPortState>((set, get) => ({
       return;
     }
     get().toast(`Lanzando ${pkg}…`, "info");
+    // v9: componente EXACTO del agente (am start -n directo)
+    const entry = [...get().userApps, ...get().systemApps].find(
+      (a) => a.packageName === pkg,
+    );
+    const component = entry?.component ?? null;
+    const fallbackStart = async () => {
+      if (displayName != null && displayName > 0) {
+        return component
+          ? webAdb.startActivityOnDisplay(component, displayName)
+          : webAdb.launchOnDisplay(pkg, displayName);
+      }
+      await webAdb.shellSafe(
+        component
+          ? `am start -n ${component}`
+          : `monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`,
+      );
+      return true;
+    };
     try {
       if (controller) {
         // scrcpy 3.3: START_APP arranca la app EN el display virtual
         // (mismo código que el JAR original: setLaunchDisplayId)
         await controller.startApp(pkg, { forceStop: false, searchByName: false });
-      } else if (displayName != null && displayName > 0) {
-        // fallback shell: am start --display N
-        await webAdb.launchOnDisplay(pkg, displayName);
       } else {
-        await webAdb.shellSafe(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
+        await fallbackStart();
       }
       get().togglePanel("drawerOpen", false);
       // v7: la taskbar muestra la app al momento (sin esperar el tick de 4s)
       setTimeout(() => void useStore.getState().refreshRunningApps(), 1_200);
     } catch {
       try {
-        if (displayName != null && displayName > 0) {
-          await webAdb.launchOnDisplay(pkg, displayName);
-        } else {
-          await webAdb.shellSafe(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
-        }
+        await fallbackStart();
         get().togglePanel("drawerOpen", false);
         setTimeout(() => void useStore.getState().refreshRunningApps(), 1_200);
       } catch {
@@ -875,9 +986,9 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v4: HOME del escritorio — lanza el launcher SELECCIONADO con el
-   * protocolo robusto (verificación en el display virtual). Si falla,
-   * abre el selector para elegir otro (p.ej. HyperDroid).
+   * v4→v9: HOME del escritorio. v9: el PREDETERMINADO del teléfono manda
+   * (resuelto por el agente); el original (companion) solo si el usuario
+   * lo eligió explícitamente en el selector.
    */
   launchHome: async () => {
     const displayId = get().displayId;
@@ -887,13 +998,19 @@ export const useStore = create<DexPortState>((set, get) => ({
       return;
     }
 
-    const selected =
-      get().selectedLauncherComponent ??
+    // v9: prioridad — predefinido del teléfono → elegido → original
+    const selected = get().selectedLauncherComponent;
+    const isExplicitCompanion = selected?.startsWith(COMPANION_PKG) === true;
+    const preferred =
+      (await get().resolveHomeLauncher()) ??
+      (selected && !isExplicitCompanion
+        ? selected
+        : null) ??
       // sin elección previa: el original si está instalado
       (get().companionInstalled ? COMPANION_MAIN_ACTIVITY : null);
 
-    if (selected) {
-      const ok = await get().selectLauncher(selected);
+    if (preferred) {
+      const ok = await get().selectLauncher(preferred);
       if (ok) return;
     } else {
       // sin selección posible → intentar el protocolo genérico HOME
@@ -1187,7 +1304,18 @@ export const useStore = create<DexPortState>((set, get) => ({
         webAdb.listPackages("system"),
       ]);
       const { userApps, systemApps } = parsePackageList(userOut, sysOut);
-      set({ userApps, systemApps, appsLoading: false });
+      // v9: superponer labels/íconos/componentes REALES cacheados (del
+      // agente v2) — al reconectar el drawer nace con íconos genuinos
+      set({
+        userApps: overlayIconCache(userApps),
+        systemApps: overlayIconCache(systemApps),
+        appsLoading: false,
+      });
+      // v9: si el agente ya está conectado, refrescar también la fuente
+      // real (labels del PackageManager + íconos que falten)
+      if (useStore.getState().agentStatus === "connected") {
+        void useStore.getState().syncAgentApps();
+      }
     } catch {
       set({ appsLoading: false });
     }
@@ -1292,6 +1420,22 @@ export const useStore = create<DexPortState>((set, get) => ({
     const pong = await agentBridge.ping();
     if (pong) {
       set({ agentStatus: "connected", agentPing: pong });
+      // v9: el agente v1 (solo detección) se ACTUALIZA solo a v2
+      // (íconos reales + notificaciones + HOME determinista)
+      if (pong.version < 2) {
+        if (!agentUpgradeAttempted) {
+          agentUpgradeAttempted = true;
+          get().toast("Actualizando DexPort Agent a v2 — íconos y notificaciones…", "info");
+          void get().installAgent();
+          // el servicio de accesibilidad renace tras el upgrade → re-check
+          setTimeout(() => void useStore.getState().checkAgent(), 6_000);
+        }
+        return;
+      }
+      // v9: al conectar → apps/íconos reales + launcher predefinido + notifs
+      void useStore.getState().syncAgentApps();
+      void useStore.getState().resolveHomeLauncher();
+      void useStore.getState().refreshNotifications();
       return;
     }
     const installed = await agentBridge.isInstalled();
@@ -1318,8 +1462,12 @@ export const useStore = create<DexPortState>((set, get) => ({
         set({ agentStatus: "connected" });
         const pong = await agentBridge.ping();
         if (pong) set({ agentPing: pong });
-        get().toast("DexPort Agent activo — detección de apps exacta ✓", "success");
+        get().toast("DexPort Agent v2 activo — detección, íconos y notificaciones ✓", "success");
         void get().refreshRunningApps();
+        // v9: sincronizar apps reales + íconos + HOME determinista + notifs
+        void get().syncAgentApps();
+        void get().resolveHomeLauncher();
+        void get().refreshNotifications();
       } else {
         set({ agentStatus: "no-permission" });
         get().toast(
@@ -1340,6 +1488,198 @@ export const useStore = create<DexPortState>((set, get) => ({
   agentAction: async (a) => {
     if (get().agentStatus !== "connected") return false;
     return agentBridge.performAction(a);
+  },
+
+  // ═════════════════════════════════════════════════════════
+  // v9: APPS REALES + ÍCONOS + NOTIFICACIONES (agente v2)
+  // ═════════════════════════════════════════════════════════
+
+  /**
+   * v9: sincroniza las apps LANZABLES reales del teléfono — etiquetas del
+   * PackageManager (no el diccionario), componente exacto de cada una y
+   * flags de sistema reales. La lista del agente REEMPLAZA la de
+   * `pm list packages` (que incluye apps sin ícono lanzable) y hereda los
+   * íconos ya cacheados para no perderlos. Después baja los íconos que
+   * falten, por lotes.
+   */
+  syncAgentApps: async () => {
+    const s = get();
+    if (s.agentStatus !== "connected") return;
+    try {
+      const apps = await agentBridge.getApps();
+      if (apps.length === 0) return;
+
+      const prevByPkg = new Map<string, AppEntry>();
+      for (const e of s.userApps) prevByPkg.set(e.packageName, e);
+      for (const e of s.systemApps) prevByPkg.set(e.packageName, e);
+
+      const toEntry = (a: AgentAppInfo): AppEntry => {
+        const prev = prevByPkg.get(a.packageName);
+        const cached = iconCache.get(a.packageName);
+        return {
+          packageName: a.packageName,
+          label: a.label || cached?.label || prev?.label || packageToLabel(a.packageName),
+          system: a.system,
+          ...(a.component ? { component: a.component } : {}),
+          icon: cached?.icon ?? prev?.icon ?? null,
+        };
+      };
+
+      const user = apps
+        .filter((a) => !a.system)
+        .map(toEntry)
+        .sort((a, b) => a.label.localeCompare(b.label));
+      const sys = apps
+        .filter((a) => a.system)
+        .map(toEntry)
+        .sort((a, b) => a.label.localeCompare(b.label));
+
+      set({ userApps: user, systemApps: sys, agentAppsSynced: true });
+
+      // persistir labels/componentes (los íconos se añaden al llegar)
+      for (const a of apps) {
+        const cached = iconCache.get(a.packageName);
+        iconCache.set(a.packageName, {
+          label: a.label,
+          ...(cached?.icon ? { icon: cached.icon } : {}),
+          ...(a.component ? { component: a.component } : {}),
+        });
+      }
+      scheduleIconCacheSave();
+    } catch {
+      /* el próximo check reintenta */
+    }
+    void get().syncAgentIcons();
+  },
+
+  /**
+   * v9: baja los íconos PNG reales que falten — lotes de 12, aplicando
+   * cada lote al estado (los íconos van apareciendo progresivamente en
+   * el drawer/taskbar/TaskView). Terminado el lote útil (respuesta
+   * vacía) o la desconexión, para.
+   */
+  syncAgentIcons: async () => {
+    if (iconSyncBusy) return;
+    iconSyncBusy = true;
+    try {
+      for (;;) {
+        const s = get();
+        if (s.agentStatus !== "connected") return;
+        const missing = [...s.userApps, ...s.systemApps]
+          .filter((a) => !a.icon)
+          .map((a) => a.packageName)
+          .slice(0, 12);
+        if (missing.length === 0) return;
+        const map = await agentBridge.getIcons(missing).catch(() => new Map<string, string>());
+        if (map.size === 0) return; // nada útil → no insistir
+        const apply = (list: AppEntry[]) =>
+          list.map((e) => {
+            const icon = map.get(e.packageName);
+            if (!icon) return e;
+            const cached = iconCache.get(e.packageName);
+            iconCache.set(e.packageName, {
+              label: e.label,
+              icon,
+              ...(e.component ? { component: e.component } : {}),
+              ...(cached?.component && !e.component ? { component: cached.component } : {}),
+            });
+            return { ...e, icon };
+          });
+        const st = get();
+        set({ userApps: apply(st.userApps), systemApps: apply(st.systemApps) });
+        scheduleIconCacheSave();
+      }
+    } finally {
+      iconSyncBusy = false;
+    }
+  },
+
+  /**
+   * v9: refresca el ESPEJO DE NOTIFICACIONES del teléfono. La primera
+   * carga no avisa (evita una ráfaga de toasts al conectar); después,
+   * cada notificación NUEVA muestra un toast estilo escritorio.
+   */
+  refreshNotifications: async () => {
+    const s = get();
+    if (s.agentStatus !== "connected") return;
+    const res = await agentBridge.getNotifications();
+    if (!res) return;
+    set({ notifications: res.notifications, notifListenerEnabled: res.enabled });
+    if (!res.enabled) return;
+
+    if (notifFirstLoad) {
+      for (const n of res.notifications) seenNotifKeys.add(n.key);
+      notifFirstLoad = false;
+      return;
+    }
+    // toasts de notificaciones nuevas (máx. 3 por refresco)
+    let shown = 0;
+    for (const n of res.notifications) {
+      if (seenNotifKeys.has(n.key)) continue;
+      seenNotifKeys.add(n.key);
+      if (shown < 3 && !n.ongoing && (n.title || n.text)) {
+        shown++;
+        get().toast(
+          `${n.label || n.packageName}: ${n.title || n.text}`.slice(0, 110),
+          "info",
+        );
+      }
+    }
+  },
+
+  /** v9: descarta una notificación desde la web (y refresca). */
+  dismissNotification: async (key) => {
+    const ok = await agentBridge.dismissNotification(key);
+    if (ok) {
+      seenNotifKeys.delete(key);
+      set({ notifications: get().notifications.filter((n) => n.key !== key) });
+    } else {
+      get().toast("El teléfono no permitió descartar la notificación", "error");
+    }
+  },
+
+  /** v9: limpia todas las notificaciones descartables. */
+  clearNotifications: async () => {
+    const ok = await agentBridge.clearNotifications();
+    if (ok) {
+      for (const n of get().notifications) seenNotifKeys.delete(n.key);
+      set({ notifications: [] });
+    }
+  },
+
+  /**
+   * v9: componente del launcher PREDETERMINADO del teléfono — el sitio al
+   * que SIEMPRE vuelve el botón HOME. Fuente exacta: el agente (PackageManager
+   * .resolveActivity HOME); fallback: `cmd package resolve-activity` por shell.
+   */
+  resolveHomeLauncher: async () => {
+    const cached = get().defaultLauncherComponent;
+    if (cached) return cached;
+    if (get().agentStatus === "connected") {
+      try {
+        const l = await agentBridge.getLauncher();
+        if (l?.defaultComponent) {
+          set({ defaultLauncherComponent: l.defaultComponent });
+          return l.defaultComponent;
+        }
+      } catch {
+        /* caer al shell */
+      }
+    }
+    try {
+      const out = await webAdb.shellSafe(
+        "cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN 2>/dev/null | tail -1",
+        8_000,
+      );
+      const comp = (out.trim().split("\n").pop() ?? "").trim();
+      if (comp.includes("/") && comp.length > 3) {
+        set({ defaultLauncherComponent: comp });
+        return comp;
+      }
+    } catch {
+      /* noop */
+    }
+    return null;
   },
 
   setAudioMuted: (m) => {
@@ -1415,10 +1755,18 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v7: HOME instantáneo — keyevent HOME dirigido al display virtual
-   * (el launcher pasa al frente al instante, sin protocolo am start).
-   * Si tras 1.2s el display sigue sin contenido, el launcher murió →
-   * protocolo robusto completo (selectLauncher con verificación).
+   * v9: HOME DETERMINISTA — siempre al MISMO sitio: el launcher
+   * PREDETERMINADO del teléfono (resuelto por el DexPort Agent o por
+   * `cmd package resolve-activity`, cacheado en defaultLauncherComponent).
+   *
+   * Estrategia:
+   *   1. `am start -n <predefinido> --display <vd>` — crea/mueve la tarea
+   *      del launcher al display virtual (determinista, el mismo launcher
+   *      SIEMPRE; ya no el companion ni el primero de la lista)
+   *   2. keyevent HOME dirigido al vd — afianza (lo trae al frente si ya
+   *      estaba en el display)
+   *   3. verificación diferida: si el display sigue sin contenido →
+   *      protocolo robusto completo (launchHome) como red de seguridad
    */
   goHomeSmart: async () => {
     const vd = get().displayId;
@@ -1426,10 +1774,23 @@ export const useStore = create<DexPortState>((set, get) => ({
       get().sendKeyAction(3); // HOME físico (modo espejo)
       return;
     }
+
+    // ── 1+2: launcher predefinido, explícito ──
+    const target =
+      (await get().resolveHomeLauncher()) ?? get().selectedLauncherComponent;
+    if (target) {
+      const started = await webAdb.startActivityOnDisplay(target, vd);
+      // afianzar con el HOME del sistema sobre el display virtual
+      await webAdb.inputKeyeventOnDisplay(3, vd).catch(() => false);
+      if (started) {
+        setTimeout(() => void useStore.getState().refreshRunningApps(), 900);
+        return;
+      }
+    }
+
+    // ── 3: fallback v7 — keyevent + verificación con protocolo completo ──
     const before = get().runningApps.some((t) => t.displayId === vd);
     await get().sendNavKey(3);
-    // verificación diferida: si no había NADA en el display (launcher muerto)
-    // o no aparece tras el keyevent → relanzar con el protocolo completo
     setTimeout(async () => {
       try {
         await get().refreshRunningApps();
@@ -1596,6 +1957,10 @@ export const useStore = create<DexPortState>((set, get) => ({
     await restorePowerSetting();
     await displayEngine.stop();
     await webAdb.disconnect();
+    // v9: reiniciar el detector de notificaciones nuevas
+    seenNotifKeys.clear();
+    notifFirstLoad = true;
+    agentUpgradeAttempted = false;
     set({
       phase: "landing",
       appBoot: { message: "", progress: 0 },
@@ -1613,6 +1978,11 @@ export const useStore = create<DexPortState>((set, get) => ({
       agentPing: null,
       agentInstall: { phase: "idle", progress: 0, message: "" },
       agentTasks: [],
+      // v9
+      agentAppsSynced: false,
+      notifications: [],
+      notifListenerEnabled: false,
+      defaultLauncherComponent: null,
       displayId: null,
       controlOnline: false,
       mirrorMode: false,
@@ -1636,6 +2006,7 @@ export const useStore = create<DexPortState>((set, get) => ({
         settingsOpen: false,
         shortcutsOpen: false,
         taskViewOpen: false,
+        notificationsOpen: false,
       },
     });
   },
@@ -1778,6 +2149,10 @@ function startTelemetryLoop(): void {
     const s = useStore.getState();
     if (s.phase === "desktop" && !s.reconnecting) {
       void s.refreshTelemetry();
+      // v9: espejo de notificaciones cada 5s (con el agente conectado)
+      if (s.agentStatus === "connected") {
+        void s.refreshNotifications();
+      }
     }
   }, 5000);
 }

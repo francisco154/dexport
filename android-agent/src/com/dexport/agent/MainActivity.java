@@ -94,7 +94,9 @@ public class MainActivity extends Activity {
                         + "abre su puente local en el puerto 8458.\n\n"
                         + "3. DexPort consulta ese puente para ver las apps y ventanas abiertas (del teléfono y "
                         + "del escritorio virtual), saber cuál está enfocada y enviar Atrás/Inicio/Recientes de forma fiable.\n\n"
-                        + "4. No sale ningún dato del dispositivo: la conexión pasa por el cable USB (ADB)."));
+                        + "4. v2: además espeja las NOTIFICACIONES activas (con su permiso propio, también por ADB), "
+                        + "entrega los ÍCONOS y nombres reales de las apps y resuelve el launcher predefinido.\n\n"
+                        + "5. No sale ningún dato del dispositivo: la conexión pasa por el cable USB (ADB)."));
 
         box.addView(sectionTitle("Privacidad"), sectionLp());
         box.addView(paragraph(
@@ -104,8 +106,10 @@ public class MainActivity extends Activity {
 
         box.addView(sectionTitle("Puente"), sectionLp());
         box.addView(paragraph(
-                "Comandos: ping · tasks.get_all · windows.get_all · events.recent · foreground.get · "
+                "Comandos v1: ping · tasks.get_all · windows.get_all · events.recent · foreground.get · "
                         + "action.back | home | recents | notifications | quick_settings | lock_screen | all_apps\n"
+                        + "Comandos v2: apps.get · icons.get · launcher.get · notifications.get · "
+                        + "notification.dismiss · notifications.clear_all\n"
                         + "Protocolo: una línea JSON por request → una línea JSON de respuesta (puerto 127.0.0.1:"
                         + AgentServer.PORT + ")."));
 
@@ -123,12 +127,14 @@ public class MainActivity extends Activity {
             return;
         }
         boolean enabled = AgentAccessibilityService.isServiceRunning();
+        boolean notif = AgentNotificationListener.isConnected();
         String sdk = Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")";
         boolean multi = Build.VERSION.SDK_INT >= 33;
         if (enabled) {
             statusLine.setTextColor(0xFF4ADE80);
             statusLine.setText("● ACTIVO — puente 127.0.0.1:" + AgentServer.PORT
-                    + "\nAndroid " + sdk + (multi ? " · ventanas por display ✓" : ""));
+                    + "\nAndroid " + sdk + (multi ? " · ventanas por display ✓" : "")
+                    + "\nNotificaciones: " + (notif ? "espejadas ✓" : "no concedidas"));
         } else {
             statusLine.setTextColor(0xFFF59E0B);
             statusLine.setText("○ SIN PERMISO — activa «DexPort Agent»\nen Accesibilidad"

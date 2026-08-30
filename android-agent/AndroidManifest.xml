@@ -51,5 +51,17 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
+
+        <!-- v2: espejo de notificaciones (se activa por ADB con
+             `cmd notification allow_listener com.dexport.agent/.AgentNotificationListener`) -->
+        <service
+            android:name=".AgentNotificationListener"
+            android:exported="false"
+            android:label="@string/notif_listener_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

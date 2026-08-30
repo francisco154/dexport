@@ -20,6 +20,7 @@ import { WindowControls } from "./WindowControls";
 import { AppDrawer } from "./AppDrawer";
 import { TaskView } from "./TaskView";
 import { MediaPanel, DevicePanel, SettingsPanel, ShortcutsModal } from "./Panels";
+import { NotificationCenter } from "./NotificationCenter";
 import { ReconnectOverlay } from "./ReconnectOverlay";
 import { Toasts } from "./Toasts";
 import { CompanionPromptFloat } from "./CompanionInstall";
@@ -109,6 +110,8 @@ export function DesktopShell() {
         <DevicePanel />
         <SettingsPanel />
         <ShortcutsModal />
+        {/* v9: centro de notificaciones — espejo del teléfono vía Agent v2 */}
+        <NotificationCenter />
       </main>
 
       {/* v8: barra de tareas FLOTANTE — desplegada o en pastilla pequeña;

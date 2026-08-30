@@ -30,9 +30,10 @@ import { ReadableStream } from "@yume-chan/stream-extra";
 export const AGENT_PORT = 8458;
 export const AGENT_PKG = "com.dexport.agent";
 export const AGENT_SERVICE = "com.dexport.agent/com.dexport.agent.AgentAccessibilityService";
+export const AGENT_NOTIF_LISTENER = "com.dexport.agent/com.dexport.agent.AgentNotificationListener";
 export const AGENT_APK_URL = "dexport-agent.apk";
 export const AGENT_APK_DEVICE_PATH = "/data/local/tmp/dexport-agent.apk";
-export const AGENT_APK_SIZE = 45_707;
+export const AGENT_APK_SIZE = 49_801;
 
 /** Tarea/app abierta según el agente (ventana TYPE_APPLICATION). */
 export interface AgentTask {
@@ -64,6 +65,40 @@ export interface AgentPing {
   device: string;
   /** true si el agente distingue ventanas por display (API 33+) */
   multiDisplay: boolean;
+  /** v2: true si el espejo de notificaciones tiene permiso */
+  notifications: boolean;
+}
+
+/** v2: app lanzable con etiqueta real (del PackageManager del teléfono). */
+export interface AgentAppInfo {
+  packageName: string;
+  label: string;
+  /** "pkg/pkg.Activity" exacto para `am start -n` */
+  component: string;
+  system: boolean;
+}
+
+/** v2: launcher HOME instalado. */
+export interface AgentLauncher {
+  component: string;
+  packageName: string;
+  label: string;
+  isDefault: boolean;
+}
+
+/** v2: notificación activa espejada desde el teléfono. */
+export interface AgentNotification {
+  key: string;
+  packageName: string;
+  label: string;
+  title: string;
+  text: string;
+  when: number;
+  postedAt: number;
+  ongoing: boolean;
+  clearable: boolean;
+  /** PNG base64 de la app emisora (si el agente ya lo tenía cacheado) */
+  icon?: string;
 }
 
 export type AgentInstallPhase =
@@ -92,16 +127,20 @@ export class AgentBridge {
   // Protocolo (líneas JSON por conexión, como el companion 8457)
   // ═════════════════════════════════════════════════════════
 
-  /** Request/response de una línea. null si el agente no responde. */
-  async request(command: string, timeoutMs = 6_000): Promise<Record<string, unknown> | null> {
+  /** Request/response de una línea (payload extra opcional). null si el agente no responde. */
+  async request(
+    command: string,
+    timeoutMs = 6_000,
+    payload: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown> | null> {
     const adb = webAdb.adb;
     if (!adb) throw new Error("Dispositivo no conectado");
     const socket = await adb.createSocket(`tcp:${AGENT_PORT}`);
     try {
       const id = `ag${requestSeq++}`;
-      const payload = JSON.stringify({ type: command, command, id }) + "\n";
+      const body = JSON.stringify({ type: command, command, id, ...payload }) + "\n";
       const writer = socket.writable.getWriter();
-      await writer.write(new TextEncoder().encode(payload));
+      await writer.write(new TextEncoder().encode(body));
       writer.releaseLock();
       const response = await Promise.race([
         readLine(socket.readable),
@@ -135,6 +174,7 @@ export class AgentBridge {
         android: String(res.android ?? ""),
         device: String(res.device ?? ""),
         multiDisplay: res.multi_display === true,
+        notifications: res.notifications === true,
       };
     } catch {
       return null;
@@ -196,6 +236,136 @@ export class AgentBridge {
   }
 
   // ═════════════════════════════════════════════════════════
+  // v2: apps reales (labels + componentes + íconos)
+  // ═════════════════════════════════════════════════════════
+
+  /** apps.get — apps lanzables con ETIQUETAS reales y componente exacto. */
+  async getApps(timeoutMs = 15_000): Promise<AgentAppInfo[]> {
+    const res = await this.request("apps.get", timeoutMs);
+    if (!res || !Array.isArray(res.apps)) return [];
+    const out: AgentAppInfo[] = [];
+    for (const raw of res.apps as Record<string, unknown>[]) {
+      const pkg = String(raw.package_name ?? "");
+      if (!pkg) continue;
+      out.push({
+        packageName: pkg,
+        label: String(raw.label ?? pkg),
+        component: String(raw.component ?? ""),
+        system: raw.system === true,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * icons.get — lote de íconos PNG base64 (el agente renderiza el drawable
+   * del launcher a 64px). Máx. 12 paquetes por request para no saturar el
+   * túnel; devuelve pkg → dataURL.
+   */
+  async getIcons(packages: string[], timeoutMs = 20_000): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (packages.length === 0) return out;
+    const res = await this.request("icons.get", timeoutMs, {
+      packages: packages.slice(0, 12),
+    });
+    if (!res || !Array.isArray(res.icons)) return out;
+    for (const raw of res.icons as Record<string, unknown>[]) {
+      const pkg = String(raw.package_name ?? "");
+      const b64 = String(raw.icon ?? "");
+      if (pkg && b64.startsWith("iVBOR")) {
+        out.set(pkg, `data:image/png;base64,${b64}`);
+      }
+    }
+    return out;
+  }
+
+  /** launcher.get — el launcher PREDETERMINADO del teléfono + todos los HOME. */
+  async getLauncher(
+    timeoutMs = 8_000,
+  ): Promise<{ defaultComponent: string | null; launchers: AgentLauncher[] } | null> {
+    const res = await this.request("launcher.get", timeoutMs);
+    if (!res || typeof res.launcher !== "object" || !res.launcher) return null;
+    const l = res.launcher as Record<string, unknown>;
+    const def = (l.default ?? {}) as Record<string, unknown>;
+    const launchers: AgentLauncher[] = [];
+    if (Array.isArray(l.launchers)) {
+      for (const raw of l.launchers as Record<string, unknown>[]) {
+        const component = String(raw.component ?? "");
+        if (!component) continue;
+        launchers.push({
+          component,
+          packageName: String(raw.package_name ?? component.split("/")[0]),
+          label: String(raw.label ?? ""),
+          isDefault: raw.is_default === true,
+        });
+      }
+    }
+    return {
+      defaultComponent: String(def.component ?? "") || null,
+      launchers,
+    };
+  }
+
+  // ═════════════════════════════════════════════════════════
+  // v2: espejo de notificaciones
+  // ═════════════════════════════════════════════════════════
+
+  /** notifications.get — lista viva (enabled=false si falta el permiso). */
+  async getNotifications(
+    timeoutMs = 8_000,
+  ): Promise<{ enabled: boolean; notifications: AgentNotification[] } | null> {
+    try {
+      const res = await this.request("notifications.get", timeoutMs);
+      if (!res || typeof res.notifications !== "object" || !res.notifications) return null;
+      const n = res.notifications as Record<string, unknown>;
+      const out: AgentNotification[] = [];
+      if (Array.isArray(n.notifications)) {
+        for (const raw of n.notifications as Record<string, unknown>[]) {
+          const key = String(raw.key ?? "");
+          const pkg = String(raw.package_name ?? "");
+          if (!key || !pkg) continue;
+          const b64 = String(raw.icon ?? "");
+          out.push({
+            key,
+            packageName: pkg,
+            label: String(raw.label ?? pkg),
+            title: String(raw.title ?? ""),
+            text: String(raw.text ?? ""),
+            when: Number(raw.when ?? 0),
+            postedAt: Number(raw.posted_at ?? raw.when ?? 0),
+            ongoing: raw.ongoing === true,
+            clearable: raw.clearable !== false,
+            ...(b64.startsWith("iVBOR") ? { icon: `data:image/png;base64,${b64}` } : {}),
+          });
+        }
+      }
+      return { enabled: n.enabled === true, notifications: out };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Descarta una notificación por key (desde la web). */
+  async dismissNotification(key: string): Promise<boolean> {
+    try {
+      const res = await this.request("notification.dismiss", 5_000, { key });
+      return !!res && res.performed === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Limpia todas las notificaciones descartables. */
+  async clearNotifications(): Promise<boolean> {
+    try {
+      const res = await this.request("notifications.clear_all", 5_000);
+      return !!res && res.performed === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════
   // Instalación por ADB (APK + permiso de accesibilidad)
   // ═════════════════════════════════════════════════════════
 
@@ -207,11 +377,11 @@ export class AgentBridge {
     const adb = webAdb.adb;
     if (!adb) throw new Error("Dispositivo no conectado");
 
-    // ── 1. Descargar el APK embebido en la web (45 KB, instantáneo) ──
+    // ── 1. Descargar el APK embebido en la web (50 KB, instantáneo) ──
     onProgress({
       phase: "downloading",
       progress: 0.05,
-      message: "Descargando DexPort Agent (45 KB)…",
+      message: "Descargando DexPort Agent v2 (50 KB)…",
     });
     const response = await fetch(AGENT_APK_URL);
     if (!response.ok && !response.body) {
@@ -281,10 +451,23 @@ export class AgentBridge {
     // ── 4. Conceder el permiso de ACCESIBILIDAD por ADB ──
     onProgress({
       phase: "enabling",
-      progress: 0.8,
+      progress: 0.75,
       message: "Activando permiso de accesibilidad…",
     });
     await webAdb.shellSafe(enableAccessibilityScript(), 10_000);
+
+    // ── 4b. v2: activar el ESPEJO DE NOTIFICACIONES por ADB ──
+    // (NotificationListenerService: `cmd notification allow_listener`)
+    onProgress({
+      phase: "enabling",
+      progress: 0.82,
+      message: "Activando el espejo de notificaciones…",
+    });
+    await webAdb.shellSafe(
+      `cmd notification allow_listener ${AGENT_NOTIF_LISTENER} 2>/dev/null; true`,
+      8_000,
+    );
+
     // abrir la app del agente: «des-detiene» el paquete (una app recién
     // instalada está en estado stopped y algunas ROMs no ligan el servicio
     // de accesibilidad hasta despierta)
@@ -350,7 +533,8 @@ async function readLine(readable: ReadableStream<Uint8Array>): Promise<string | 
       text += new TextDecoder().decode(value, { stream: true });
       const nl = text.indexOf("\n");
       if (nl >= 0) return text.slice(0, nl);
-      if (text.length > 1_000_000) break;
+      // v2: los lotes de iconos pueden pesar unos cientos de KB por línea
+      if (text.length > 8_000_000) break;
     }
     return text.trim() ? text : null;
   } finally {
