@@ -365,12 +365,13 @@ export function DevicePanel() {
 /** ── Ajustes del display virtual (v6: pantalla, personalización, calidad) ── */
 
 /**
- * v8→v11: sección del DexPort Agent — estado + instalación + explicación.
- * v2: detección EXACTA de apps/ventanas + íconos y nombres reales +
- * espejo de notificaciones + info del launcher predefinido del teléfono.
- * v11: se puede DESACTIVAR (modo solo ADB) o desinstalar — el escritorio
- * funciona sin él (dumpsys + pm list), solo que sin íconos reales ni
- * espejo de notificaciones.
+ * v8→v12: sección del DexPort Agent — estado + instalación + explicación.
+ * v5: PAQUETE ÚNICO + HIBERNACIÓN — una sola solicitud trae apps +
+ * íconos + launcher + notificaciones; después el agente DUERME
+ * (cero consumo). Multitarea 100 % ADB. Se puede DESACTIVAR
+ * (modo solo ADB) o desinstalar — el escritorio funciona sin él
+ * (dumpsys + pm list), solo que sin íconos reales ni espejo de
+ * notificaciones.
  */
 function AgentSettingsSection() {
   const agentStatus = useStore((s) => s.agentStatus);
@@ -392,8 +393,8 @@ function AgentSettingsSection() {
   const statusLabel: Record<string, string> = {
     checking: "Comprobando…",
     missing: "No instalado",
-    "no-permission": "Instalado — falta permiso de accesibilidad",
-    connected: "Activo",
+    "no-permission": "Instalado — el puente no responde",
+    connected: "Activo (paquete entregado — hibernando)",
     disabled: "Desactivado — modo solo ADB",
     unknown: "Desconocido",
   };
@@ -410,17 +411,17 @@ function AgentSettingsSection() {
     <>
       <h3 className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         <Radar size={13} className="text-sky-300/70" />
-        DexPort Agent v4 · detección + íconos + notificaciones
+        DexPort Agent v5 · paquete único + hibernación
       </h3>
       <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-sky-400/15 bg-sky-400/5 p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="text-[13px] font-medium text-white">
-              App auxiliar con permiso de accesibilidad
+              App auxiliar sin permiso de accesibilidad
             </p>
             <p className={`text-[11.5px] ${statusColor[agentStatus] ?? "text-[#9499a3]"}`}>
               {agentStatus === "connected" && agentPing
-                ? `Activo v${agentPing.version} · Android ${agentPing.android} (${agentPing.device})`
+                ? `v${agentPing.version} · Android ${agentPing.android} (${agentPing.device})`
                 : statusLabel[agentStatus] ?? agentStatus}
             </p>
           </div>
@@ -445,14 +446,14 @@ function AgentSettingsSection() {
           )}
         </div>
 
-        {/* v9: capacidades activas */}
+        {/* v12: capacidades activas */}
         {agentStatus === "connected" && (
           <div className="flex flex-wrap gap-1.5 text-[10.5px]">
             <span className="rounded-full bg-[#3ddc84]/12 px-2.5 py-1 text-[#3ddc84]">
-              ✓ apps y ventanas en vivo
+              ✓ paquete entregado — agente hibernando
             </span>
             <span className="rounded-full bg-[#38bdf8]/12 px-2.5 py-1 text-[#7dd3fc]">
-              ✓ íconos y nombres reales
+              ✓ íconos y nombres reales (caché local)
             </span>
             <span
               className={`rounded-full px-2.5 py-1 ${
@@ -462,11 +463,11 @@ function AgentSettingsSection() {
               }`}
             >
               {notifListenerEnabled
-                ? `✓ notificaciones espejadas (${notifications.length})`
+                ? `✓ notificaciones (al abrir el panel: ${notifications.length})`
                 : "⚠ notificaciones sin permiso"}
             </span>
             <span className="rounded-full bg-white/6 px-2.5 py-1 text-[#c3c9d4]">
-              ✓ HOME al launcher del escritorio
+              ✓ multitarea 100% ADB — nunca interfiere
             </span>
             <span
               className={`rounded-full px-2.5 py-1 ${
@@ -484,18 +485,18 @@ function AgentSettingsSection() {
         )}
 
         <p className="text-[11.5px] leading-relaxed text-[#aab3bf]">
-          El agente mapea lo que ADB no puede ver: apps y ventanas abiertas en
-          ambas pantallas (título, actividad y foco por display), los íconos y
-          nombres reales de TODAS las apps instaladas, las notificaciones activas
-          del teléfono (centro de notificaciones del escritorio) y el launcher
-          predefinido del teléfono — informativo, para elegirlo en el selector
-          si lo prefieres para el escritorio. v4: los lotes de íconos se
-          autodrenan en el worker (ya no se quedan a medias), las notificaciones
-          viajan SIN ícono en cada poll (el ícono lo pone la web por paquete —
-          mucho menos tráfico USB) y todo el trabajo pesado sigue en un único
-          hilo de fondo de baja prioridad, solo en el perfil principal (sin
-          duplicados en Island). Se instala y recibe todos sus permisos por ADB
-          — sin tocar el teléfono. Todo queda en tu dispositivo (USB).
+          v5 — <b className="text-white">una frecuencia, leída una vez</b>: al
+          conectar, la web pide UN paquete con todas las apps lanzables,
+          sus íconos reales, el launcher predefinido y las notificaciones.
+          Recibido el paquete, el agente <b className="text-white">hiberna</b>
+          (puente apagado, notificación fuera, cero consumo) y NO vuelve a
+          sondearse nada. La multitarea (apps abiertas, foco por display,
+          Atrás/Inicio/Recientes) es 100 % ADB shell: sin servicio de
+          accesibilidad, es imposible que interfiera con tu teléfono. Las
+          notificaciones se refrescan solo al abrir su panel (el agente
+          despierta un instante y vuelve a dormir). Instalación y permisos
+          por ADB, solo en el perfil principal (sin duplicados en Island).
+          Todo queda en tu dispositivo (USB).
         </p>
 
         {/* v11: control del agente — opcional desde esta versión */}
@@ -545,9 +546,9 @@ function AgentSettingsSection() {
 
         {agentStatus === "no-permission" && (
           <p className="rounded-xl bg-amber-400/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
-            Si «Activar» no lo conecta, abre en el teléfono: Ajustes →
-            Accesibilidad → DexPort Agent → activar. (Algunas ROMs lo piden
-            manualmente la primera vez.)
+            El puente no respondió. Pulsa «Activar» (lo reinstala y enciende el
+            puente por ADB) o abre la app «DexPort Agent» en el teléfono y toca
+            «Abrir puente ahora». Si sigue sin conectar, reconecta el USB.
           </p>
         )}
         {agentStatus === "connected" && !notifListenerEnabled && (

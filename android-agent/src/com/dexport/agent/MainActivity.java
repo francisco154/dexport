@@ -7,7 +7,6 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
-import android.provider.Settings;
 import android.view.Gravity;
 
 import android.widget.Button;
@@ -17,8 +16,9 @@ import android.widget.TextView;
 
 /**
  * Pantalla de estado del DexPort Agent (UI en Java puro, sin dependencias).
- * Muestra si el servicio de accesibilidad está activo y el puerto del
- * puente, con acceso directo a los ajustes de accesibilidad.
+ * v5: el puente ya NO requiere permiso de accesibilidad — vive en un
+ * servicio en primer plano que DexPort enciende/apaga por ADB y que
+ * HIBERNA solo (cero consumo) cuando no hay nada que servir.
  */
 public class MainActivity extends Activity {
 
@@ -47,7 +47,7 @@ public class MainActivity extends Activity {
         box.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Puente de accesibilidad para DexPort (navegador)");
+        subtitle.setText("Puente de datos para DexPort (navegador) — sin permiso de accesibilidad");
         subtitle.setTextSize(13);
         subtitle.setTextColor(0xFF9AA3B2);
         box.addView(subtitle);
@@ -66,52 +66,79 @@ public class MainActivity extends Activity {
         slp.topMargin = dp(22);
         box.addView(statusLine, slp);
 
-        // ── botón ajustes ──
-        Button openSettings = new Button(this);
-        openSettings.setText("Abrir ajustes de accesibilidad");
-        openSettings.setTextColor(Color.WHITE);
-        openSettings.setTextSize(14);
+        // ── botón: abrir el puente ahora ──
+        Button openBridge = new Button(this);
+        openBridge.setText("Abrir puente ahora (90 s de gracia)");
+        openBridge.setTextColor(Color.WHITE);
+        openBridge.setTextSize(14);
         GradientDrawable btnBg = new GradientDrawable();
         btnBg.setColor(0xFF1D4ED8);
         btnBg.setCornerRadius(dp(12));
-        openSettings.setBackground(btnBg);
-        openSettings.setPadding(dp(16), dp(12), dp(16), dp(12));
-        openSettings.setOnClickListener(v -> {
-            try {
-                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-            } catch (Exception ignored) {
-            }
-        });
+        openBridge.setBackground(btnBg);
+        openBridge.setPadding(dp(16), dp(12), dp(16), dp(12));
+        openBridge.setOnClickListener(v -> startBridge());
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, -2);
         blp.topMargin = dp(14);
-        box.addView(openSettings, blp);
+        box.addView(openBridge, blp);
+
+        // ── botón: hibernar ya ──
+        Button hibernate = new Button(this);
+        hibernate.setText("Hibernar ya (cero consumo)");
+        hibernate.setTextColor(0xFFB9C0CC);
+        hibernate.setTextSize(13);
+        GradientDrawable hbBg = new GradientDrawable();
+        hbBg.setColor(0xFF141922);
+        hbBg.setCornerRadius(dp(12));
+        hbBg.setStroke(1, 0xFF243040);
+        hibernate.setBackground(hbBg);
+        hibernate.setPadding(dp(16), dp(10), dp(16), dp(10));
+        hibernate.setOnClickListener(v -> stopService(
+                new Intent(this, AgentServerService.class)));
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(-1, -2);
+        hlp.topMargin = dp(8);
+        box.addView(hibernate, hlp);
 
         // ── instrucciones ──
-        box.addView(sectionTitle("Cómo funciona"), sectionLp());
+        box.addView(sectionTitle("Cómo funciona (v5)"), sectionLp());
         box.addView(paragraph(
                 "1. DexPort (la web) instala este agente automáticamente por ADB cuando pulsas «Instalar Agent» — solo en el perfil principal del teléfono (nunca en perfiles de trabajo como Island).\n\n"
-                        + "2. El permiso de accesibilidad también se concede por ADB — al activarse, el agente abre su puente local en el puerto 8458.\n\n"
-                        + "3. DexPort consulta ese puente para ver las apps y ventanas abiertas (del teléfono y del escritorio virtual), saber cuál está enfocada y enviar Atrás/Inicio/Recientes de forma fiable.\n\n"
-                        + "4. Además espeja las NOTIFICACIONES activas (permiso propio por ADB), entrega los ÍCONOS y nombres reales de TODAS las apps instaladas y resuelve el launcher predefinido.\n\n"
-                        + "5. v3-v4 — RECONSTRUIDO para no intervenir NUNCA en el rendimiento: servicio de accesibilidad ultraligero y trabajo pesado en un único hilo de fondo. v4: íconos por lotes que se autodrenan (fix de los íconos a medias) y notificaciones sin ícono en el poll (menos tráfico USB).\n\n"
+                        + "2. SIN permiso de accesibilidad: el puente vive en un servicio en primer plano que DexPort enciende por USB (am start-foreground-service) solo cuando lo necesita.\n\n"
+                        + "3. UNA única solicitud («paquete»): apps lanzables + TODOS los íconos + launcher predefinido. Recibido el paquete, el agente HIBERNA: servidor apagado, notificación fuera, cero consumo de CPU y batería.\n\n"
+                        + "4. La multitarea (apps abiertas, foco por display, Atrás/Inicio/Recientes) la hace DexPort 100 % por ADB shell — el agente ya no participa ahí, así que NUNCA interfiere con tu teléfono.\n\n"
+                        + "5. Las notificaciones se espejan solo cuando abres el centro de notificaciones de la web (el agente despierta un instante y vuelve a dormir).\n\n"
                         + "6. No sale ningún dato del dispositivo: la conexión pasa por el cable USB (ADB)."));
 
         box.addView(sectionTitle("Privacidad"), sectionLp());
         box.addView(paragraph(
-                "El agente no envía datos a Internet ni los guarda. Solo escucha en localhost y responde "
-                        + "a las consultas de DexPort que llegan por USB. Puedes desactivarlo o desinstalarlo "
-                        + "cuando quieras desde Ajustes → Accesibilidad → Apps instaladas."));
+                "El agente no envía datos a Internet ni los guarda. Solo escucha en localhost "
+                        + "y responde a las consultas de DexPort que llegan por USB. Puedes "
+                        + "desinstalarlo cuando quieras desde la propia web (Ajustes) o del teléfono."));
 
         box.addView(sectionTitle("Puente"), sectionLp());
         box.addView(paragraph(
-                "Comandos: ping · tasks.get_all · windows.get_all · events.recent · foreground.get · "
-                        + "action.back | home | recents | notifications | quick_settings | lock_screen | all_apps · "
-                        + "apps.get · icons.get · launcher.get · notifications.get · "
-                        + "notification.dismiss · notifications.clear_all\n"
-                        + "Protocolo: una línea JSON por request → una línea JSON de respuesta (puerto 127.0.0.1:"
-                        + AgentServer.PORT + ")."));
+                "Comandos v5: ping · package.get · agent.hibernate · notifications.get · "
+                        + "notification.dismiss · notifications.clear_all · launcher.get\n"
+                        + "Protocolo: una línea JSON por request → una línea JSON de respuesta "
+                        + "(puerto 127.0.0.:" + AgentServer.PORT + ").\n"
+                        + "Eliminados en v5 (100 % ADB): tasks/windows/events/foreground/action.*"));
 
         setContentView(scroll);
+
+        // abrir el puente también al abrir la app (comodidad)
+        startBridge();
+    }
+
+    private void startBridge() {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(new Intent(this, AgentServerService.class));
+            } else {
+                startService(new Intent(this, AgentServerService.class));
+            }
+        } catch (Exception ignored) {
+        }
+        // refrescar el estado en un momento (el servicio arranca async)
+        statusLine.postDelayed(this::updateStatus, 600);
     }
 
     @Override
@@ -124,21 +151,23 @@ public class MainActivity extends Activity {
         if (statusLine == null) {
             return;
         }
-        boolean enabled = AgentAccessibilityService.isServiceRunning();
+        boolean running = AgentServerService.isBridgeRunning();
         boolean notif = AgentNotificationListener.isConnected();
         String sdk = Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")";
-        boolean multi = Build.VERSION.SDK_INT >= 33;
         int userId = android.os.Process.myUid() / 100_000;
-        if (enabled) {
+        if (running) {
             statusLine.setTextColor(0xFF4ADE80);
-            statusLine.setText("● ACTIVO v4 — puente 127.0.0.1:" + AgentServer.PORT
-                    + "\nAndroid " + sdk + (multi ? " · ventanas por display ✓" : "")
+            statusLine.setText("● PUENTE ACTIVO v5 — 127.0.0.1:" + AgentServer.PORT
+                    + "\nAndroid " + sdk
                     + "\nNotificaciones: " + (notif ? "espejadas ✓" : "no concedidas")
-                    + "\nPerfil: " + (userId == 0 ? "principal ✓" : ("TRABAJO (" + userId + ") — reinstalá desde DexPort")));
+                    + "\nPerfil: " + (userId == 0 ? "principal ✓" : ("TRABAJO (" + userId + ") — reinstalá desde DexPort"))
+                    + "\nHiberna solo tras 90 s sin consultas");
         } else {
-            statusLine.setTextColor(0xFFF59E0B);
-            statusLine.setText("○ SIN PERMISO — activa «DexPort Agent»\nen Accesibilidad"
-                    + "\nAndroid " + sdk);
+            statusLine.setTextColor(0xFF7DD3FC);
+            statusLine.setText("◌ HIBERNANDO v5 — cero consumo"
+                    + "\nAndroid " + sdk
+                    + "\nDexPort lo despierta por USB cuando lo necesita"
+                    + "\n(perfil " + (userId == 0 ? "principal ✓" : ("TRABAJO (" + userId + ")")) + ")");
         }
     }
 

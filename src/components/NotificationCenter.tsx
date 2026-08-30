@@ -1,19 +1,24 @@
 /**
- * DexPort v9 — NotificationCenter
+ * DexPort v9→v12 — NotificationCenter
  * ════════════════════════════════════════════════════════════
- * La nueva utilidad del DexPort Agent v2: el CENTRO DE
- * NOTIFICACIONES del escritorio. Las notificaciones activas del
- * teléfono se espejan en vivo (NotificationListenerService,
+ * El CENTRO DE NOTIFICACIONES del escritorio. Las notificaciones
+ * activas del teléfono se espejan (NotificationListenerService,
  * permiso concedido por ADB) y se pueden:
  *
  *   · leer      — app + ícono real + título + texto + hora
  *   · abrir     — un clic lanza la app emisora en el escritorio
  *   · descartar — botón X por notificación o «Limpiar todo»
  *
+ * v12 — BAJO DEMANDA: ya NO hay sondeo cada 5 s. Al ABRIR el panel
+ * se despierta el agente (si hiberna) y se refresca; mientras esté
+ * abierto se refresca cada 12 s; al cerrarlo el agente vuelve a
+ * hibernar solo (90 s sin consultas).
+ *
  * Estilo: panel lateral derecho estilo action center de Windows,
  * con la misma estética glass-dark del resto de paneles.
  */
 
+import { useEffect } from "react";
 import { Bell, BellOff, Loader2, Trash2, X, Smartphone } from "lucide-react";
 import { useStore } from "../store/store";
 import { appColor, appInitial } from "../utils/appNames";
@@ -129,18 +134,22 @@ export function NotificationCenter() {
   const userApps = useStore((s) => s.userApps);
   const systemApps = useStore((s) => s.systemApps);
 
+  // v12: refresco SOLO mientras el panel está ABIERTO (al abrir ya, y
+  // cada 12 s mientras dure abierto — el agente despierta solo si
+  // hiberna; cerrado el panel, cero tráfico del agente)
+  useEffect(() => {
+    if (!open) return;
+    void refreshNotifications();
+    const t = setInterval(() => void refreshNotifications(), 12_000);
+    return () => clearInterval(t);
+  }, [open, refreshNotifications]);
+
   if (!open) return null;
 
-  // íconos ya conocidos de las apps emisoras (del sync del agente v2)
+  // íconos ya conocidos de las apps emisoras (del paquete del agente v5)
   const iconByPkg = new Map<string, string | null>();
   for (const a of userApps) if (a.icon) iconByPkg.set(a.packageName, a.icon);
   for (const a of systemApps) if (a.icon) iconByPkg.set(a.packageName, a.icon);
-  // las notificaciones pueden traer su propio ícono (cache del agente)
-  for (const n of notifications) {
-    if (n.icon && !iconByPkg.has(n.packageName)) {
-      iconByPkg.set(n.packageName, n.icon);
-    }
-  }
 
   const clearableCount = notifications.filter((n) => n.clearable).length;
 

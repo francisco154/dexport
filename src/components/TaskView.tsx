@@ -156,10 +156,10 @@ function TaskCard({
 }
 
 /**
- * v8: tarjeta del DexPort Agent — la app con permiso de accesibilidad
- * que mapea TODO lo que ADB no ve (apps abiertas, ventanas, foco…).
- * Aparece en el TaskView cuando no hay tareas detectadas o cuando el
- * agente aún no está activo: es el fix real del «No hay apps abiertas».
+ * v8→v12: tarjeta del DexPort Agent — la app que entrega el PAQUETE
+ * ÚNICO (apps + íconos reales + notificaciones) y luego HIBERNA.
+ * Aparece en el TaskView cuando el agente aún no está activo:
+ * es el fix real del «No hay apps abiertas».
  */
 function AgentCard({ prominent = false }: { prominent?: boolean }) {
   const agentStatus = useStore((s) => s.agentStatus);
@@ -172,8 +172,8 @@ function AgentCard({ prominent = false }: { prominent?: boolean }) {
     return (
       <div className="flex items-center gap-2 rounded-full border border-sky-400/25 bg-sky-400/10 px-3 py-1.5 text-[11.5px] text-sky-200">
         <ShieldCheck size={13} className="text-sky-300" />
-        DexPort Agent activo{agentPing ? ` · Android ${agentPing.android}` : ""} —
-        detección exacta de ventanas
+        DexPort Agent{agentPing ? ` v${agentPing.version}` : ""} — paquete
+        entregado, hibernando (cero consumo)
       </div>
     );
   }
@@ -207,19 +207,20 @@ function AgentCard({ prominent = false }: { prominent?: boolean }) {
       <div className="min-w-0 flex-1">
         <p className="text-[12.5px] font-semibold text-white">
           {agentStatus === "no-permission"
-            ? "Activa el DexPort Agent para ver las apps abiertas"
-            : "Instala el DexPort Agent (45 KB) para ver las apps abiertas"}
+            ? "Enciende el DexPort Agent para los íconos reales"
+            : "Instala el DexPort Agent (54 KB) para los íconos reales"}
         </p>
         <p className="mt-0.5 text-[11.5px] leading-relaxed text-[#aab3bf]">
-          App con permiso de accesibilidad que mapea ventanas, apps y foco de
-          ambas pantallas — se instala y se le dan permisos por ADB, sin tocar
-          el teléfono.
+          Entrega las apps con sus íconos y nombres reales en UN paquete y
+          luego hiberna (cero consumo). Instalación y permisos por ADB, sin
+          tocar el teléfono — la detección de apps abiertas funciona igual
+          (100 % ADB).
         </p>
       </div>
       <div className="flex items-center gap-2">
         <button className="btn-solid !py-2 !text-[12px]" onClick={() => void installAgent()}>
           <Download size={12} />
-          {agentStatus === "no-permission" ? "Reintentar permisos" : "Instalar Agent"}
+          {agentStatus === "no-permission" ? "Reintentar conexión" : "Instalar Agent"}
         </button>
         {agentStatus !== "missing" && (
           <button

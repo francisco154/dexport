@@ -1,26 +1,30 @@
 /**
- * DexPort v8 — AgentBridge
+ * DexPort v12 — AgentBridge (Agent v5: paquete único + hibernación)
  * ════════════════════════════════════════════════════════════
  * Conexión con el DEXPORT AGENT (com.dexport.agent) — la app
- * auxiliar con permiso de ACCESIBILIDAD que mapea todo lo que
- * ADB no puede ver:
+ * auxiliar que le da a la web lo que ADB shell no puede ver:
  *
- *   · apps y ventanas abiertas en TODAS las pantallas (teléfono +
- *     display virtual scrcpy + ventanas freeform DeX)
- *   · qué app está enfocada en cada display (API 33+)
- *   · actividad real de cada tarea (sin parsear dumpsys)
- *   · acciones globales fiables: ATRÁS / HOME / RECIENTES /
- *     notificaciones / ajustes rápidos / bloqueo / all-apps
+ *   · apps lanzables con ETIQUETAS reales + COMPONENTE exacto
+ *   · TODOS los íconos PNG reales (64 px)
+ *   · el launcher predefinido del teléfono (informativo)
+ *   · espejo de notificaciones (cuando abres el panel)
  *
- * El agente abre un servidor de líneas JSON en 127.0.0.1:8458
- * (mismo protocolo que el companion original de 8457) que aquí
- * alcanzamos por el túnel de WebADB: adb.createSocket("tcp:8458").
+ * v5 — FILOSOFÍA «UNA FRECUENCIA, LEÍDA UNA VEZ»:
+ *   · La web pide `package.get` UNA sola vez → el agente responde
+ *     con TODO (apps + íconos + launcher + notificaciones) y la
+ *     web le ordena `agent.hibernate` → el puente TCP se APAGA
+ *     (cero consumo en el teléfono). Sin polling, sin lotes,
+ *     sin reintentos: una frecuencia, leída una vez.
+ *   · El agente NO tiene servicio de accesibilidad (eliminado):
+ *     la multitarea (apps abiertas, foco por display, Atrás/
+ *     Inicio/Recientes) vive 100 % en ADB shell — el agente ya
+ *     no puede interferir con el teléfono.
+ *   · Despertar: `am start-foreground-service -n …/.AgentServerService`
+ *     por ADB (lo hace esta clase al conectar o al abrir el panel
+ *     de notificaciones). Hiberna solo tras 90 s ocioso.
  *
- * También instala el agente por ADB:
- *   fetch(public/dexport-agent.apk) → adb.sync().write() →
- *   pm install -r → settings put secure
- *   enabled_accessibility_services (permiso de accesibilidad
- *   concedido por ADB, sin tocar el teléfono).
+ * El agente abre un servidor de líneas JSON en 127.0.0.1:8458 que
+ * aquí alcanzamos por el túnel de WebADB: adb.createSocket("tcp:8458").
  */
 
 import { webAdb } from "./adb";
@@ -29,34 +33,18 @@ import { ReadableStream } from "@yume-chan/stream-extra";
 /** Puerto del puente local del DexPort Agent en el dispositivo. */
 export const AGENT_PORT = 8458;
 export const AGENT_PKG = "com.dexport.agent";
-export const AGENT_SERVICE = "com.dexport.agent/com.dexport.agent.AgentAccessibilityService";
+/** v5: servicio en primer plano que aloja el puente (encendible/apagable por ADB). */
+export const AGENT_SERVER_SERVICE =
+  "com.dexport.agent/com.dexport.agent.AgentServerService";
+/** v≤4: el viejo servicio de accesibilidad — solo para LIMPIAR su rastro. */
+export const AGENT_LEGACY_A11Y =
+  "com.dexport.agent/com.dexport.agent.AgentAccessibilityService";
 export const AGENT_NOTIF_LISTENER = "com.dexport.agent/com.dexport.agent.AgentNotificationListener";
 export const AGENT_APK_URL = "dexport-agent.apk";
 export const AGENT_APK_DEVICE_PATH = "/data/local/tmp/dexport-agent.apk";
-export const AGENT_APK_SIZE = 53_899;
-
-/** Tarea/app abierta según el agente (ventana TYPE_APPLICATION). */
-export interface AgentTask {
-  windowId: number;
-  packageName: string;
-  /** componente "pkg/com.pkg.Activity" deducido del último evento */
-  activity: string;
-  title: string;
-  /** -1 en API < 33 (el agente no puede saberlo → se cruza con dumpsys) */
-  displayId: number;
-  isActive: boolean;
-  isFocused: boolean;
-  layer: number;
-}
-
-export type AgentActionName =
-  | "back"
-  | "home"
-  | "recents"
-  | "notifications"
-  | "quick_settings"
-  | "lock_screen"
-  | "all_apps";
+export const AGENT_APK_SIZE = 53_813;
+/** Protocolo que esta web sabe hablar (agentes menores → upgrade). */
+export const AGENT_REQUIRED_VERSION = 5;
 
 export interface AgentPing {
   version: number;
@@ -65,22 +53,24 @@ export interface AgentPing {
   device: string;
   /** true si el agente distingue ventanas por display (API 33+) */
   multiDisplay: boolean;
-  /** v2: true si el espejo de notificaciones tiene permiso */
+  /** true si el espejo de notificaciones tiene permiso */
   notifications: boolean;
-  /** v3: perfil en el que corre el agente (0 = principal; >0 = trabajo/Island) */
+  /** perfil en el que corre el agente (0 = principal; >0 = trabajo/Island) */
   userId: number;
 }
 
-/** v2: app lanzable con etiqueta real (del PackageManager del teléfono). */
+/** v5: app lanzable con etiqueta real + ícono PNG incluido en el paquete. */
 export interface AgentAppInfo {
   packageName: string;
   label: string;
   /** "pkg/pkg.Activity" exacto para `am start -n` */
   component: string;
   system: boolean;
+  /** PNG base64 (data URL) — llega DENTRO del paquete único */
+  icon?: string;
 }
 
-/** v2: launcher HOME instalado. */
+/** v5: launcher HOME instalado. */
 export interface AgentLauncher {
   component: string;
   packageName: string;
@@ -88,7 +78,7 @@ export interface AgentLauncher {
   isDefault: boolean;
 }
 
-/** v2: notificación activa espejada desde el teléfono. */
+/** v5: notificación activa espejada desde el teléfono. */
 export interface AgentNotification {
   key: string;
   packageName: string;
@@ -99,8 +89,16 @@ export interface AgentNotification {
   postedAt: number;
   ongoing: boolean;
   clearable: boolean;
-  /** PNG base64 de la app emisora (si el agente ya lo tenía cacheado) */
-  icon?: string;
+}
+
+/** v5: EL PAQUETE — todo lo que la web necesita, en UNA respuesta. */
+export interface AgentPackage {
+  apps: AgentAppInfo[];
+  launcher: { defaultComponent: string | null; launchers: AgentLauncher[] } | null;
+  notifications: { enabled: boolean; notifications: AgentNotification[] };
+  /** true si el agente devolvió lo que tenía antes de terminar */
+  partial?: boolean;
+  builtAt?: number;
 }
 
 export type AgentInstallPhase =
@@ -145,9 +143,8 @@ export class AgentBridge {
       const writer = socket.writable.getWriter();
       await writer.write(new TextEncoder().encode(body));
       writer.releaseLock();
-      // v11: el timer del race se limpia SIEMPRE. Antes quedaba un timer
-      // huérfano por petición (cientos por sesión) que, con la pestaña en
-      // segundo plano, Chrome acumulaba y disparaba en ráfaga al volver.
+      // v11: el timer del race se limpia SIEMPRE (antes quedaban
+      // timers huérfanos que Chrome acumulaba por cientos).
       const timeoutP = new Promise<string | null>((resolve) => {
         timer = setTimeout(() => resolve(null), timeoutMs);
       });
@@ -168,7 +165,50 @@ export class AgentBridge {
     }
   }
 
-  /** ¿El agente está instalado, con permiso y respondiendo? */
+  /**
+   * v5: request de un comando INTERACTIVO (notificaciones) — si el
+   * puente está hibernando, lo despierta por ADB y reintenta una vez.
+   */
+  async requestLive(
+    command: string,
+    timeoutMs = 8_000,
+    payload: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown> | null> {
+    let res = await this.request(command, timeoutMs, payload).catch(() => null);
+    if (!res) {
+      await this.wake();
+      res = await this.request(command, timeoutMs, payload).catch(() => null);
+    }
+    return res;
+  }
+
+  // ═════════════════════════════════════════════════════════
+  // v5: DESPERTAR / HIBERNAR — el puente se enciende y apaga por ADB
+  // ═════════════════════════════════════════════════════════
+
+  /**
+   * Enciende el puente (servicio en primer plano) por ADB. Barato:
+   * un comando shell. Si ya estaba despierto, no hace nada raro.
+   */
+  async wake(): Promise<void> {
+    await webAdb.shellSafe(
+      `am start-foreground-service -n ${AGENT_SERVER_SERVICE} 2>/dev/null` +
+        ` || am startservice -n ${AGENT_SERVER_SERVICE} 2>/dev/null; true`,
+      8_000,
+    );
+    // el socket abre casi al instante, pero damos aire al binder
+    await sleep(700);
+  }
+
+  /**
+   * Ordena al agente HIBERNAR ya (tras recibir el paquete): el
+   * servidor TCP se apaga y la notificación del puente desaparece.
+   */
+  async hibernate(): Promise<void> {
+    await this.request("agent.hibernate", 3_000).catch(() => null);
+  }
+
+  /** ¿El agente está instalado, despierto y respondiendo? */
   async ping(timeoutMs = 4_000): Promise<AgentPing | null> {
     try {
       const res = await this.request("ping", timeoutMs);
@@ -194,154 +234,78 @@ export class AgentBridge {
     return out.includes(AGENT_PKG) && out.includes(".apk");
   }
 
-  /** Apps abiertas (ventanas TYPE_APPLICATION de todos los displays). */
-  async getTasks(timeoutMs = 6_000): Promise<AgentTask[]> {
-    const res = await this.request("tasks.get_all", timeoutMs);
-    if (!res || !Array.isArray(res.tasks)) return [];
-    const out: AgentTask[] = [];
-    for (const raw of res.tasks as Record<string, unknown>[]) {
-      const pkg = String(raw.package_name ?? "");
-      if (!pkg) continue;
-      out.push({
-        windowId: Number(raw.window_id ?? 0),
-        packageName: pkg,
-        activity: String(raw.activity ?? ""),
-        title: String(raw.title ?? ""),
-        displayId: Number(raw.display_id ?? -1),
-        isActive: raw.is_active === true,
-        isFocused: raw.is_focused === true,
-        layer: Number(raw.layer ?? 0),
-      });
-    }
-    // ventanas de la misma app → quedarse con la de mayor capa
-    const byPkg = new Map<string, AgentTask>();
-    for (const t of out) {
-      const cur = byPkg.get(t.packageName);
-      if (!cur || t.layer > cur.layer) byPkg.set(t.packageName, t);
-    }
-    return [...byPkg.values()];
-  }
-
-  /** App en primer plano (ventana activa global). */
-  async getForeground(timeoutMs = 5_000): Promise<{ packageName: string; activity: string } | null> {
-    const res = await this.request("foreground.get", timeoutMs);
-    if (!res || typeof res.foreground !== "object" || !res.foreground) return null;
-    const fg = res.foreground as Record<string, unknown>;
-    const pkg = String(fg.package_name ?? "");
-    return pkg ? { packageName: pkg, activity: String(fg.activity ?? "") } : null;
-  }
-
-  /** Acción global del agente (más fiable que keyevent plano). */
-  async performAction(action: AgentActionName): Promise<boolean> {
-    try {
-      const res = await this.request(`action.${action}`, 5_000);
-      return !!res && res.status === "success" && res.performed === true;
-    } catch {
-      return false;
-    }
-  }
-
   // ═════════════════════════════════════════════════════════
-  // v2: apps reales (labels + componentes + íconos)
+  // v5: EL PAQUETE ÚNICO
   // ═════════════════════════════════════════════════════════
 
   /**
-   * apps.get — apps lanzables con ETIQUETAS reales y componente exacto.
-   * v3: el agente responde instantáneo desde cache; si aún está
-   * enumerando (pending), espera y reintenta una vez.
+   * package.get — UNA solicitud con TODO: apps lanzables con TODOS
+   * los íconos + launcher + notificaciones. El agente la retiene
+   * (long-poll) hasta que su hilo de fondo terminó de renderizar
+   * cada ícono → aquí llega COMPLETA. Timeout holgado (200 s).
    */
-  async getApps(timeoutMs = 8_000): Promise<AgentAppInfo[]> {
-    const parse = (res: Record<string, unknown> | null): AgentAppInfo[] => {
-      if (!res || !Array.isArray(res.apps)) return [];
-      const out: AgentAppInfo[] = [];
-      for (const raw of res.apps as Record<string, unknown>[]) {
+  async getPackage(timeoutMs = 200_000): Promise<AgentPackage | null> {
+    const res = await this.request("package.get", timeoutMs).catch(() => null);
+    if (!res || res.status !== "success" || typeof res.package !== "object" || !res.package) {
+      return null;
+    }
+    const p = res.package as Record<string, unknown>;
+    const apps: AgentAppInfo[] = [];
+    if (Array.isArray(p.apps)) {
+      for (const raw of p.apps as Record<string, unknown>[]) {
         const pkg = String(raw.package_name ?? "");
-        if (!pkg) continue;
-        out.push({
+        if (!pkg || !String(raw.component ?? "")) continue;
+        const b64 = String(raw.icon ?? "");
+        apps.push({
           packageName: pkg,
           label: String(raw.label ?? pkg),
           component: String(raw.component ?? ""),
           system: raw.system === true,
+          ...(b64.startsWith("iVBOR") ? { icon: `data:image/png;base64,${b64}` } : {}),
         });
       }
-      return out;
-    };
-    let res = await this.request("apps.get", timeoutMs).catch(() => null);
-    let apps = parse(res);
-    // v11: la PRIMERA enumeración del agente (cientos de apps, binder
-    // por label + componente) puede tardar decenas de segundos → esperar
-    // con paciencia. Antes: un único reintento y la lista quedaba a medias
-    // (y con ella, los íconos).
-    for (let i = 0; i < 5 && apps.length === 0 && res?.pending === true; i++) {
-      await sleep(2_500);
-      res = await this.request("apps.get", timeoutMs).catch(() => null);
-      apps = parse(res);
     }
-    return apps;
-  }
-
-  /**
-   * icons.get — v3: el agente NUNCA renderiza sincrono (congelaba el
-   * teléfono en v2). Devuelve los listos + la lista de "pending" que
-   * genera en fondo; hay que volver a preguntar en ~1.5s.
-   */
-  async getIcons(
-    packages: string[],
-    timeoutMs = 10_000,
-  ): Promise<{ icons: Map<string, string>; pending: string[] }> {
-    const out = new Map<string, string>();
-    if (packages.length === 0) return { icons: out, pending: [] };
-    const res = await this
-      .request("icons.get", timeoutMs, { packages: packages.slice(0, 12) })
-      .catch(() => null);
-    if (!res) return { icons: out, pending: [] };
-    if (Array.isArray(res.icons)) {
-      for (const raw of res.icons as Record<string, unknown>[]) {
-        const pkg = String(raw.package_name ?? "");
-        const b64 = String(raw.icon ?? "");
-        if (pkg && b64.startsWith("iVBOR")) {
-          out.set(pkg, `data:image/png;base64,${b64}`);
+    // launcher
+    let launcher: AgentPackage["launcher"] = null;
+    if (p.launcher && typeof p.launcher === "object") {
+      const l = p.launcher as Record<string, unknown>;
+      const def = (l.default ?? {}) as Record<string, unknown>;
+      const launchers: AgentLauncher[] = [];
+      if (Array.isArray(l.launchers)) {
+        for (const raw of l.launchers as Record<string, unknown>[]) {
+          const component = String(raw.component ?? "");
+          if (!component) continue;
+          launchers.push({
+            component,
+            packageName: String(raw.package_name ?? component.split("/")[0]),
+            label: String(raw.label ?? ""),
+            isDefault: raw.is_default === true,
+          });
         }
       }
+      launcher = {
+        defaultComponent: String(def.component ?? "") || null,
+        launchers,
+      };
     }
-    const pending: string[] = [];
-    if (Array.isArray(res.pending)) {
-      for (const p of res.pending) {
-        if (typeof p === "string" && p) pending.push(p);
-      }
-    }
-    return { icons: out, pending };
-  }
-
-  /** launcher.get — el launcher PREDETERMINADO del teléfono + todos los HOME. */
-  async getLauncher(
-    timeoutMs = 8_000,
-  ): Promise<{ defaultComponent: string | null; launchers: AgentLauncher[] } | null> {
-    const res = await this.request("launcher.get", timeoutMs);
-    if (!res || typeof res.launcher !== "object" || !res.launcher) return null;
-    const l = res.launcher as Record<string, unknown>;
-    const def = (l.default ?? {}) as Record<string, unknown>;
-    const launchers: AgentLauncher[] = [];
-    if (Array.isArray(l.launchers)) {
-      for (const raw of l.launchers as Record<string, unknown>[]) {
-        const component = String(raw.component ?? "");
-        if (!component) continue;
-        launchers.push({
-          component,
-          packageName: String(raw.package_name ?? component.split("/")[0]),
-          label: String(raw.label ?? ""),
-          isDefault: raw.is_default === true,
-        });
-      }
+    // notificaciones (incluidas en el paquete)
+    let notifications: AgentPackage["notifications"] = { enabled: false, notifications: [] };
+    const n = res.notifications;
+    if (n && typeof n === "object") {
+      notifications = parseNotifications(n as Record<string, unknown>);
     }
     return {
-      defaultComponent: String(def.component ?? "") || null,
-      launchers,
+      apps,
+      launcher,
+      notifications,
+      ...(p.partial === true ? { partial: true } : {}),
+      ...(typeof p.built_at === "number" ? { builtAt: p.built_at as number } : {}),
     };
   }
 
   // ═════════════════════════════════════════════════════════
-  // v2: espejo de notificaciones
+  // v5: notificaciones BAJO DEMANDA (panel abierto) — despiertan
+  // el puente un instante si estaba hibernando
   // ═════════════════════════════════════════════════════════
 
   /** notifications.get — lista viva (enabled=false si falta el permiso). */
@@ -349,31 +313,10 @@ export class AgentBridge {
     timeoutMs = 8_000,
   ): Promise<{ enabled: boolean; notifications: AgentNotification[] } | null> {
     try {
-      const res = await this.request("notifications.get", timeoutMs);
+      const res = await this.requestLive("notifications.get", timeoutMs);
       if (!res || typeof res.notifications !== "object" || !res.notifications) return null;
-      const n = res.notifications as Record<string, unknown>;
-      const out: AgentNotification[] = [];
-      if (Array.isArray(n.notifications)) {
-        for (const raw of n.notifications as Record<string, unknown>[]) {
-          const key = String(raw.key ?? "");
-          const pkg = String(raw.package_name ?? "");
-          if (!key || !pkg) continue;
-          const b64 = String(raw.icon ?? "");
-          out.push({
-            key,
-            packageName: pkg,
-            label: String(raw.label ?? pkg),
-            title: String(raw.title ?? ""),
-            text: String(raw.text ?? ""),
-            when: Number(raw.when ?? 0),
-            postedAt: Number(raw.posted_at ?? raw.when ?? 0),
-            ongoing: raw.ongoing === true,
-            clearable: raw.clearable !== false,
-            ...(b64.startsWith("iVBOR") ? { icon: `data:image/png;base64,${b64}` } : {}),
-          });
-        }
-      }
-      return { enabled: n.enabled === true, notifications: out };
+      const parsed = parseNotifications(res.notifications as Record<string, unknown>);
+      return { enabled: parsed.enabled, notifications: parsed.notifications };
     } catch {
       return null;
     }
@@ -382,7 +325,7 @@ export class AgentBridge {
   /** Descarta una notificación por key (desde la web). */
   async dismissNotification(key: string): Promise<boolean> {
     try {
-      const res = await this.request("notification.dismiss", 5_000, { key });
+      const res = await this.requestLive("notification.dismiss", 5_000, { key });
       return !!res && res.performed === true;
     } catch {
       return false;
@@ -392,7 +335,7 @@ export class AgentBridge {
   /** Limpia todas las notificaciones descartables. */
   async clearNotifications(): Promise<boolean> {
     try {
-      const res = await this.request("notifications.clear_all", 5_000);
+      const res = await this.requestLive("notifications.clear_all", 5_000);
       return !!res && res.performed === true;
     } catch {
       return false;
@@ -400,9 +343,9 @@ export class AgentBridge {
   }
 
   // ═════════════════════════════════════════════════════════
-  // Instalación por ADB (APK + permiso de accesibilidad)
-  // v3: SOLO en el perfil principal (user 0) + limpieza de
-  // duplicados en perfiles de trabajo (Island)
+  // Instalación por ADB (APK + despertar el puente)
+  // v5: SIN permiso de accesibilidad — el puente vive en un
+  // servicio en primer plano. SOLO perfil principal (user 0).
   // ═════════════════════════════════════════════════════════
 
   /**
@@ -437,9 +380,10 @@ export class AgentBridge {
   }
 
   /**
-   * Flujo completo: descargar APK → push → pm install --user 0 →
-   * limpiar duplicados de perfiles de trabajo → conceder permisos
-   * por ADB → verificar ping.
+   * Flujo completo v5: descargar APK → push → pm install --user 0 →
+   * limpiar duplicados de Island → limpiar el rastro de la vieja
+   * accesibilidad (v≤4) → permitir el listener de notificaciones →
+   * ENCENDER el puente (servicio en primer plano) → verificar ping.
    */
   async install(onProgress: ProgressCb = () => undefined): Promise<boolean> {
     const adb = webAdb.adb;
@@ -449,7 +393,7 @@ export class AgentBridge {
     onProgress({
       phase: "downloading",
       progress: 0.05,
-      message: "Descargando DexPort Agent v4 (54 KB)…",
+      message: "Descargando DexPort Agent v5 (54 KB)…",
     });
     const response = await fetch(AGENT_APK_URL);
     if (!response.ok && !response.body) {
@@ -501,7 +445,7 @@ export class AgentBridge {
     onProgress({
       phase: "installing",
       progress: 0.55,
-      message: "Instalando agente (perfil principal)…",
+      message: "Instalando agente v5 (perfil principal)…",
     });
     const installOut = await webAdb.shellTimeout(
       `pm install --user 0 -r -g ${AGENT_APK_DEVICE_PATH} 2>&1 || pm install -r -g ${AGENT_APK_DEVICE_PATH} 2>&1`,
@@ -533,15 +477,16 @@ export class AgentBridge {
       });
     }
 
-    // ── 4. Conceder el permiso de ACCESIBILIDAD por ADB ──
+    // ── 4. v5: limpiar el RASTRO del viejo servicio de accesibilidad
+    //       (v≤4 lo dejó habilitado en settings; v5 ya no existe) ──
     onProgress({
       phase: "enabling",
       progress: 0.75,
-      message: "Activando permiso de accesibilidad…",
+      message: "Liberando accesibilidad (v5 no la usa)…",
     });
-    await webAdb.shellSafe(enableAccessibilityScript(), 10_000);
+    await webAdb.shellSafe(cleanLegacyAccessibilityScript(), 8_000);
 
-    // ── 4b. v2: activar el ESPEJO DE NOTIFICACIONES por ADB ──
+    // ── 4b. activar el ESPEJO DE NOTIFICACIONES por ADB ──
     // (NotificationListenerService: `cmd notification allow_listener`)
     onProgress({
       phase: "enabling",
@@ -553,59 +498,77 @@ export class AgentBridge {
       8_000,
     );
 
-    // abrir la app del agente: «des-detiene» el paquete (una app recién
-    // instalada está en estado stopped y algunas ROMs no ligan el servicio
-    // de accesibilidad hasta despierta)
-    await webAdb.shellSafe(
-      `am start -n ${AGENT_PKG}/.MainActivity 2>/dev/null`,
-      6_000,
-    );
-
-    // ── 5. Verificar que el puente responde (reintentos: el servicio
-    //       tarda ~1-2 s en arrancar tras recibir el permiso) ──
+    // ── 5. v5: ENCENDER el puente (servicio en primer plano) ──
+    // (despierta el paquete del estado stopped y abre el 8458)
     onProgress({
       phase: "verifying",
-      progress: 0.9,
-      message: "Verificando el puente del agente…",
+      progress: 0.88,
+      message: "Encendiendo el puente del agente…",
     });
+    await this.wake();
+
+    // ── 6. Verificar que el puente responde (reintentos) ──
     for (let i = 0; i < 6; i++) {
-      await sleep(900);
       const pong = await this.ping(2_500);
       if (pong) {
-        onProgress({ phase: "done", progress: 1, message: "DexPort Agent activo ✓" });
+        onProgress({ phase: "done", progress: 1, message: "DexPort Agent v5 activo ✓" });
         return true;
       }
+      await sleep(900);
     }
-    // el puente no respondió: puede requerir activación manual
-    // (algunas ROMs ignoran el settings put por USB)
     onProgress({
       phase: "done",
       progress: 1,
       message:
-        "Agente instalado — activa «DexPort Agent» en Ajustes → Accesibilidad si no se activó solo",
+        "Agente instalado — abre la app «DexPort Agent» en el teléfono y pulsa «Abrir puente ahora» si no conectó solo",
     });
     return false;
   }
 }
 
 /**
- * Script robusto de activación del servicio de accesibilidad:
- * respeta los servicios ya habilitados (append con «:») y fuerza
- * accessibility_enabled=1. El sistema liga el servicio al cambiar el
- * setting (y `am start` de la MainActivity lo despierta si estaba en
- * estado stopped tras la instalación).
+ * v5: quita SOLO nuestro componente del setting de accesibilidad
+ * (los demás servicios del usuario quedan intactos). Las versiones
+ * ≤4 del agente dejaban este rastro habilitado; la v5 no usa
+ * accesibilidad — liberar el teléfono por completo.
  */
-function enableAccessibilityScript(): string {
-  const svc = AGENT_SERVICE;
+function cleanLegacyAccessibilityScript(): string {
+  const svc = AGENT_LEGACY_A11Y;
   return (
     `svc="${svc}"; ` +
     `cur=$(settings get secure enabled_accessibility_services); ` +
-    `case "$cur" in *"$svc"*) ;; ` +
-    `*) if [ -z "$cur" ] || [ "$cur" = "null" ]; then n="$svc"; ` +
-    `else n="$cur:$svc"; fi; ` +
-    `settings put secure enabled_accessibility_services "$n"; ;; esac; ` +
-    `settings put secure accessibility_enabled 1; true`
+    `case "$cur" in *"$svc"*) ` +
+    `n=$(echo "$cur" | tr ':' '\\n' | grep -v "^$svc$" | paste -sd: -); ` +
+    `if [ -z "$n" ]; then settings delete secure enabled_accessibility_services 2>/dev/null; ` +
+    `else settings put secure enabled_accessibility_services "$n"; fi; ;; esac; ` +
+    `true`
   );
+}
+
+/** Parser común del snapshot de notificaciones del agente. */
+function parseNotifications(
+  n: Record<string, unknown>,
+): { enabled: boolean; notifications: AgentNotification[] } {
+  const out: AgentNotification[] = [];
+  if (Array.isArray(n.notifications)) {
+    for (const raw of n.notifications as Record<string, unknown>[]) {
+      const key = String(raw.key ?? "");
+      const pkg = String(raw.package_name ?? "");
+      if (!key || !pkg) continue;
+      out.push({
+        key,
+        packageName: pkg,
+        label: String(raw.label ?? pkg),
+        title: String(raw.title ?? ""),
+        text: String(raw.text ?? ""),
+        when: Number(raw.when ?? 0),
+        postedAt: Number(raw.posted_at ?? raw.when ?? 0),
+        ongoing: raw.ongoing === true,
+        clearable: raw.clearable !== false,
+      });
+    }
+  }
+  return { enabled: n.enabled === true, notifications: out };
 }
 
 async function readLine(readable: ReadableStream<Uint8Array>): Promise<string | null> {
@@ -618,8 +581,9 @@ async function readLine(readable: ReadableStream<Uint8Array>): Promise<string | 
       text += new TextDecoder().decode(value, { stream: true });
       const nl = text.indexOf("\n");
       if (nl >= 0) return text.slice(0, nl);
-      // v2: los lotes de iconos pueden pesar unos cientos de KB por línea
-      if (text.length > 8_000_000) break;
+      // v5: EL PAQUETE trae TODOS los íconos en una línea (~0.5-1.5 MB
+      // en teléfonos cargados de apps) → límite generoso
+      if (text.length > 24_000_000) break;
     }
     return text.trim() ? text : null;
   } finally {

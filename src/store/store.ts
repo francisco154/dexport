@@ -60,9 +60,9 @@ import { parsePackageList, packageToLabel, type AppEntry } from "../utils/appNam
 import {
   agentBridge,
   AGENT_PKG,
+  AGENT_REQUIRED_VERSION,
   type AgentPing,
   type AgentInstallProgress,
-  type AgentTask,
   type AgentNotification,
   type AgentAppInfo,
 } from "../services/agent";
@@ -212,16 +212,14 @@ interface DexPortState {
   /** v7: tareas abiertas en TODOS los displays (gestión estilo Windows) */
   runningApps: TaskInfo[];
 
-  // ── v8: DexPort Agent (accesibilidad) ──
+  // ── v8: DexPort Agent ──
   /** "checking" | "missing" | "no-permission" | "connected" | "unknown" */
   agentStatus: "checking" | "missing" | "no-permission" | "connected" | "disabled" | "unknown";
   agentPing: AgentPing | null;
   /** progreso de la instalación (para la UI) */
   agentInstall: AgentInstallProgress;
-  /** tareas crudas del agente (títulos reales de ventanas) */
-  agentTasks: AgentTask[];
 
-  // ── v9: DexPort Agent v2 (apps reales + notificaciones) ──
+  // ── v9/v12: DexPort Agent v5 (paquete único + notificaciones) ──
   /** apps reales sincronizadas (labels + componentes del PackageManager) */
   agentAppsSynced: boolean;
   /** notificaciones activas espejadas desde el teléfono */
@@ -294,16 +292,16 @@ interface DexPortState {
   refreshApps: () => Promise<void>;
   refreshTelemetry: () => Promise<void>;
   refreshRunningApps: () => Promise<void>;
-  /** v8: estado del DexPort Agent (instalado / permiso / puente) */
+  /** v8: estado del DexPort Agent (instalado / puente / activo) */
   checkAgent: () => Promise<void>;
-  /** v8: instala el agente + permiso de accesibilidad por ADB */
+  /** v8: instala el agente v5 por ADB (sin permiso de accesibilidad) */
   installAgent: () => Promise<void>;
-  /** v8: acciones globales del agente (ATRÁS/HOME/… fiables) */
-  agentAction: (a: "back" | "home" | "recents" | "notifications" | "quick_settings" | "lock_screen" | "all_apps") => Promise<boolean>;
-  /** v9: sincroniza apps reales (labels + componentes) e íconos por lotes */
-  syncAgentApps: () => Promise<void>;
-  /** v9: descarga los íconos que falten (lotes de 12, progresivo) */
-  syncAgentIcons: () => Promise<void>;
+  /**
+   * v12: EL PAQUETE ÚNICO — una sola solicitud `package.get` trae
+   * apps + TODOS los íconos + launcher + notificaciones; después
+   * el agente HIBERNA (cero polling posterior).
+   */
+  syncAgentPackage: (force?: boolean) => Promise<void>;
   /** v9: refresca el espejo de notificaciones (con toasts de las nuevas) */
   refreshNotifications: () => Promise<void>;
   /** v9: descarta una notificación por key */
@@ -458,8 +456,10 @@ export const displayEngine = new DisplayEngine();
 
 let telemetryTimer: ReturnType<typeof setInterval> | null = null;
 let appMonitorTimer: ReturnType<typeof setInterval> | null = null;
-/** v9: guard de syncAgentIcons (una sola tanda de lotes a la vez) */
-let iconSyncBusy = false;
+/** v12: guard de syncAgentPackage (una solicitud de paquete a la vez) */
+let agentPkgBusy = false;
+/** v12: último paquete recibido OK (evita re-pedirlo sin necesidad) */
+let agentPkgAt = 0;
 /** v10: auto-actualización del agente a v3 — un intento por sesión */
 let agentUpgradeAttempted = false;
 /** v10: limpieza de perfiles de trabajo (Island) — una vez por sesión */
@@ -470,8 +470,6 @@ let notifRefreshBusy = false;
 const seenNotifKeys = new Set<string>();
 let notifFirstLoad = true;
 let toastSeq = 1;
-/** v11: cache del dumpsys de tareas (el comando más pesado del loop) */
-let taskDumpCache = { out: "", at: 0 };
 
 export const useStore = create<DexPortState>((set, get) => ({
   phase: "landing",
@@ -518,11 +516,10 @@ export const useStore = create<DexPortState>((set, get) => ({
   appsLoading: false,
   runningApps: [],
 
-  // ── v8: DexPort Agent (accesibilidad) ──
+  // ── v8: DexPort Agent ──
   agentStatus: "checking",
   agentPing: null,
   agentInstall: { phase: "idle", progress: 0, message: "" },
-  agentTasks: [],
 
   // ── v9: agente v2 (apps reales + notificaciones + HOME determinista) ──
   agentAppsSynced: false,
@@ -1364,10 +1361,10 @@ export const useStore = create<DexPortState>((set, get) => ({
         systemApps: overlayIconCache(systemApps),
         appsLoading: false,
       });
-      // v9: si el agente ya está conectado, refrescar también la fuente
-      // real (labels del PackageManager + íconos que falten)
+      // v12: si el agente ya está conectado, pedir el PAQUETE ÚNICO
+      // (apps reales + íconos — el rastro en caché cubre mientras llega)
       if (useStore.getState().agentStatus === "connected") {
-        void useStore.getState().syncAgentApps();
+        void useStore.getState().syncAgentPackage();
       }
     } catch {
       set({ appsLoading: false });
@@ -1429,22 +1426,12 @@ export const useStore = create<DexPortState>((set, get) => ({
   refreshRunningApps: async () => {
     if (document.hidden) return; // v11: pestaña oculta → cero tráfico USB
     const vd = get().displayId;
-    const agentConnected = get().agentStatus === "connected";
-    const agentPromise: Promise<AgentTask[]> = agentConnected
-      ? agentBridge.getTasks().catch(() => [])
-      : Promise.resolve([]);
-
     try {
-      // v11: el dumpsys de actividades es el comando MÁS pesado del loop
-      // (100-200 KB cada 4 s). Con el agente conectado, las tareas frescas
-      // llegan por él cada tick → el dumpsys se reutiliza 8 s (mitad de
-      // tráfico USB) sin perder fiabilidad (taskId/display siguen al día)
-      let out = taskDumpCache.out;
-      if (!agentConnected || Date.now() - taskDumpCache.at > 8_000) {
-        out = await webAdb.shellSafe(TASK_DUMP_COMMAND, 15_000);
-        taskDumpCache = { out, at: Date.now() };
-      }
-      const agent = await agentPromise;
+      // v12: multitarea 100 % ADB — el agente ya no participa en la
+      // detección (su servicio de accesibilidad fue ELIMINADO). El
+      // dump multi-fuente (activities + window + stack + foco) en
+      // UN stream es exactamente la fuente v8 que funcionaba.
+      const out = await webAdb.shellSafe(TASK_DUMP_COMMAND, 15_000);
       const { act, win, stack, focus } = splitTaskDump(out);
       const tasks = mergeTaskSources({
         act: parseTasks(act), // foco interno por top de display
@@ -1452,16 +1439,7 @@ export const useStore = create<DexPortState>((set, get) => ({
         stacks: parseStackList(stack),
         focusPkg: focus ? parseCurrentFocus(focus) : null,
         virtualDisplayId: vd,
-        agent: agent.map((a) => ({
-          packageName: a.packageName,
-          activity: a.activity,
-          title: a.title,
-          displayId: a.displayId,
-          isActive: a.isActive,
-          isFocused: a.isFocused,
-        })),
       });
-      if (agent.length > 0) set({ agentTasks: agent });
       set({ runningApps: tasks });
     } catch {
       /* noop — el próximo tick reintenta */
@@ -1469,81 +1447,87 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v8: estado del DexPort Agent:
-   *   connected     → puente 8458 responde (permiso activo)
-   *   no-permission → APK instalado pero el servicio no está habilitado
+   * v12: estado del DexPort Agent v5:
+   *   connected     → instalado, paquete entregado, hibernando (OK)
+   *   no-permission → instalado pero el puente no responde
    *   missing       → ni siquiera instalado
-   *   disabled      → v11: el usuario lo desactivó (modo solo ADB)
+   *   disabled      → el usuario lo desactivó (modo solo ADB)
    */
   checkAgent: async () => {
     if (!webAdb.adb) return;
     // v11: agente desactivado → no usarlo en absoluto (cero polling,
     // cero upgrades — el escritorio funciona en modo solo ADB)
     if (get().agentDisabled) {
-      set({ agentStatus: "disabled", agentPing: null, agentTasks: [], notifications: [] });
+      set({ agentStatus: "disabled", agentPing: null, notifications: [] });
       return;
     }
     set((s) => (s.agentStatus === "connected" ? {} : { agentStatus: "checking" }));
-    const pong = await agentBridge.ping();
-    if (pong) {
-      set({ agentStatus: "connected", agentPing: pong });
-      // v11: el agente v1/v2/v3 se ACTUALIZA solo a v4 (íconos que se
-      // autodrenan + notificaciones sin ícono en el poll = menos USB)
-      if (pong.version < 4) {
-        if (!agentUpgradeAttempted) {
-          agentUpgradeAttempted = true;
-          get().toast(
-            "Actualizando DexPort Agent a v4 — íconos completos y menos consumo…",
-            "info",
-          );
-          void get().installAgent();
-          // el servicio de accesibilidad renace tras el upgrade → re-check
-          setTimeout(() => void useStore.getState().checkAgent(), 6_000);
-        }
-        return;
+    let pong = await agentBridge.ping();
+    if (!pong) {
+      // v12: el agente v5 HIBERNA (puente cerrado) tras entregar el
+      // paquete → despertarlo una vez por ADB y volver a intentar
+      const installed = await agentBridge.isInstalled();
+      if (installed) {
+        await agentBridge.wake().catch(() => undefined);
+        await sleep(1_100);
+        pong = await agentBridge.ping();
       }
-      // v10: ¿el agente quedó corriendo en un perfil de trabajo (Island)?
-      // → aviso + limpieza de duplicados (una vez por sesión)
-      if (pong.userId > 0) {
-        get().toast(
-          `El agente corre en el perfil ${pong.userId} (¿Island?) — reinstalando en el perfil principal…`,
-          "error",
-        );
-        if (!agentUpgradeAttempted) {
-          agentUpgradeAttempted = true;
-          void get().installAgent();
-          setTimeout(() => void useStore.getState().checkAgent(), 8_000);
-        }
-        return;
-      }
-      if (!agentProfilesCleaned) {
-        agentProfilesCleaned = true;
-        void agentBridge.cleanOtherProfiles().then((cleaned) => {
-          if (cleaned.length > 0) {
-            useStore
-              .getState()
-              .toast(
-                `Agente duplicado eliminado de ${cleaned.length} perfil(es) de trabajo ✓`,
-                "success",
-              );
-          }
+      if (!pong) {
+        set({
+          agentStatus: installed ? "no-permission" : "missing",
+          agentPing: null,
         });
+        return;
       }
-      // v9: al conectar → apps/íconos reales + launcher predefinido + notifs
-      void useStore.getState().syncAgentApps();
-      void useStore.getState().resolveHomeLauncher();
-      void useStore.getState().refreshNotifications();
+    }
+    set({ agentStatus: "connected", agentPing: pong });
+    // v12: el agente v1-v4 se ACTUALIZA solo a v5 (paquete único +
+    // hibernación + sin accesibilidad = teléfono 100 % libre)
+    if (pong.version < AGENT_REQUIRED_VERSION) {
+      if (!agentUpgradeAttempted) {
+        agentUpgradeAttempted = true;
+        get().toast(
+          "Actualizando DexPort Agent a v5 — paquete único y hibernación…",
+          "info",
+        );
+        void get().installAgent();
+        // el servicio renace tras el upgrade → re-check
+        setTimeout(() => void useStore.getState().checkAgent(), 8_000);
+      }
       return;
     }
-    const installed = await agentBridge.isInstalled();
-    set({
-      agentStatus: installed ? "no-permission" : "missing",
-      agentPing: null,
-      agentTasks: [],
-    });
+    // v10: ¿el agente quedó corriendo en un perfil de trabajo (Island)?
+    // → aviso + limpieza de duplicados (una vez por sesión)
+    if (pong.userId > 0) {
+      get().toast(
+        `El agente corre en el perfil ${pong.userId} (¿Island?) — reinstalando en el perfil principal…`,
+        "error",
+      );
+      if (!agentUpgradeAttempted) {
+        agentUpgradeAttempted = true;
+        void get().installAgent();
+        setTimeout(() => void useStore.getState().checkAgent(), 8_000);
+      }
+      return;
+    }
+    if (!agentProfilesCleaned) {
+      agentProfilesCleaned = true;
+      void agentBridge.cleanOtherProfiles().then((cleaned) => {
+        if (cleaned.length > 0) {
+          useStore
+            .getState()
+            .toast(
+              `Agente duplicado eliminado de ${cleaned.length} perfil(es) de trabajo ✓`,
+              "success",
+            );
+        }
+      });
+    }
+    // v12: UN paquete → todo → hibernar. Sin polling posterior.
+    void useStore.getState().syncAgentPackage();
   },
 
-  /** v8: instalar el agente + conceder accesibilidad por ADB (automático). */
+  /** v12: instalar el agente v5 por ADB (automático; sin accesibilidad). */
   installAgent: async () => {
     if (get().agentInstall.phase === "installing") return;
     if (get().agentDisabled) {
@@ -1563,16 +1547,17 @@ export const useStore = create<DexPortState>((set, get) => ({
         set({ agentStatus: "connected" });
         const pong = await agentBridge.ping();
         if (pong) set({ agentPing: pong });
-        get().toast("DexPort Agent v4 activo — detección, íconos y notificaciones ✓", "success");
+        get().toast(
+          "DexPort Agent v5 activo — paquete único + hibernación ✓",
+          "success",
+        );
         void get().refreshRunningApps();
-        // v9: sincronizar apps reales + íconos + HOME determinista + notifs
-        void get().syncAgentApps();
-        void get().resolveHomeLauncher();
-        void get().refreshNotifications();
+        // v12: UNA solicitud de paquete → todo → hibernar
+        void get().syncAgentPackage();
       } else {
         set({ agentStatus: "no-permission" });
         get().toast(
-          "Agent instalado — actívalo en Ajustes → Accesibilidad → DexPort Agent",
+          "Agent instalado — abre «DexPort Agent» en el teléfono y pulsa «Abrir puente ahora» si no conectó solo",
           "info",
         );
       }
@@ -1583,12 +1568,6 @@ export const useStore = create<DexPortState>((set, get) => ({
       });
       get().toast(`No se pudo instalar el Agent: ${msg.slice(0, 80)}`, "error");
     }
-  },
-
-  /** v8: acción global vía agente (ATRÁS/HOME/… fiables). */
-  agentAction: async (a) => {
-    if (get().agentStatus !== "connected") return false;
-    return agentBridge.performAction(a);
   },
 
   // ═════════════════════════════════════════════════════════
@@ -1664,7 +1643,6 @@ export const useStore = create<DexPortState>((set, get) => ({
       set({
         agentStatus: "disabled",
         agentPing: null,
-        agentTasks: [],
         notifications: [],
         notifListenerEnabled: false,
       });
@@ -1691,7 +1669,6 @@ export const useStore = create<DexPortState>((set, get) => ({
       set({
         agentStatus: "missing",
         agentPing: null,
-        agentTasks: [],
         notifications: [],
         notifListenerEnabled: false,
         agentDisabled: false,
@@ -1703,24 +1680,42 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   // ═════════════════════════════════════════════════════════
-  // v9: APPS REALES + ÍCONOS + NOTIFICACIONES (agente v2)
+  // v12: EL PAQUETE ÚNICO (agente v5) — una solicitud, y a dormir
   // ═════════════════════════════════════════════════════════
 
   /**
-   * v9: sincroniza las apps LANZABLES reales del teléfono — etiquetas del
-   * PackageManager (no el diccionario), componente exacto de cada una y
-   * flags de sistema reales. La lista del agente REEMPLAZA la de
-   * `pm list packages` (que incluye apps sin ícono lanzable) y hereda los
-   * íconos ya cacheados para no perderlos. Después baja los íconos que
-   * falten, por lotes.
+   * v12: UNA solicitud `package.get` trae TODO — apps lanzables con
+   * labels reales + componente exacto + TODOS los íconos + launcher
+   * predefinido + notificaciones. El agente retiene la respuesta
+   * hasta tener el paquete COMPLETO (long-poll) → aquí llega entera,
+   * sin lotes ni reintentos. Recibido el paquete → `agent.hibernate`
+   * → el puente se APAGA (cero consumo en el teléfono) y la web
+   * NO vuelve a hablar con el agente salvo que abras el centro de
+   * notificaciones (lo despierta un instante y vuelve a dormir).
+   *
+   * La lista del paquete REEMPLAZA la de `pm list packages` y hereda
+   * los íconos ya cacheados en localStorage (arranque instantáneo).
    */
-  syncAgentApps: async () => {
-    const s = get();
-    if (s.agentStatus !== "connected") return;
+  syncAgentPackage: async (force = false) => {
+    if (agentPkgBusy) return;
+    const s0 = get();
+    if (s0.agentStatus !== "connected") return;
+    // ya tenemos un paquete fresco → no repetir (el checkAgent de
+    // rutina tras el upgrade no debe re-descargar todo)
+    if (!force && s0.agentAppsSynced && Date.now() - agentPkgAt < 300_000) return;
+    agentPkgBusy = true;
     try {
-      const apps = await agentBridge.getApps();
-      if (apps.length === 0) return;
+      // UNA solicitud (long-poll del lado del agente). Si el puente
+      // estaba hibernando → despertarlo y reintentar una vez.
+      let pkg = await agentBridge.getPackage().catch(() => null);
+      if (!pkg) {
+        await agentBridge.wake().catch(() => undefined);
+        await sleep(1_000);
+        pkg = await agentBridge.getPackage().catch(() => null);
+      }
+      if (!pkg || pkg.apps.length === 0) return;
 
+      const s = get();
       const prevByPkg = new Map<string, AppEntry>();
       for (const e of s.userApps) prevByPkg.set(e.packageName, e);
       for (const e of s.systemApps) prevByPkg.set(e.packageName, e);
@@ -1733,111 +1728,85 @@ export const useStore = create<DexPortState>((set, get) => ({
           label: a.label || cached?.label || prev?.label || packageToLabel(a.packageName),
           system: a.system,
           ...(a.component ? { component: a.component } : {}),
-          icon: cached?.icon ?? prev?.icon ?? null,
+          icon: a.icon ?? cached?.icon ?? prev?.icon ?? null,
         };
       };
 
-      const user = apps
+      const user = pkg.apps
         .filter((a) => !a.system)
         .map(toEntry)
         .sort((a, b) => a.label.localeCompare(b.label));
-      const sys = apps
+      const sys = pkg.apps
         .filter((a) => a.system)
         .map(toEntry)
         .sort((a, b) => a.label.localeCompare(b.label));
 
       set({ userApps: user, systemApps: sys, agentAppsSynced: true });
 
-      // persistir labels/componentes (los íconos se añaden al llegar)
-      for (const a of apps) {
-        const cached = iconCache.get(a.packageName);
-        iconCache.set(a.packageName, {
-          label: a.label,
-          ...(cached?.icon ? { icon: cached.icon } : {}),
-          ...(a.component ? { component: a.component } : {}),
-        });
-      }
-      scheduleIconCacheSave();
-    } catch {
-      /* el próximo check reintenta */
-    }
-    void get().syncAgentIcons();
-  },
-
-  /**
-   * v9→v11: baja los íconos PNG reales que falten — lotes de 12, aplicando
-   * cada lote al estado (los íconos van apareciendo progresivamente en
-   * el drawer/taskbar/TaskView).
-   *
-   * v11 (fix de los íconos a medias): paciencia REAL — hasta ~3 min de
-   * rondas pending (la primera enumeración del agente tarda decenas de
-   * segundos y antes nos rendíamos a los 15s). Además el appMonitor
-   * re-kickea este sync cada ~32s mientras falten íconos → se
-   * autorrepara solo, sin sondeo agresivo.
-   */
-  syncAgentIcons: async () => {
-    if (iconSyncBusy) return;
-    iconSyncBusy = true;
-    try {
-      let pendingRounds = 0;
-      let idleRounds = 0;
-      for (;;) {
-        const s = get();
-        if (s.agentStatus !== "connected") return;
-        if (document.hidden) return; // re-kick al volver a la pestaña (appMonitor)
-        const missing = [...s.userApps, ...s.systemApps]
-          .filter((a) => !a.icon)
-          .map((a) => a.packageName)
-          .slice(0, 12);
-        if (missing.length === 0) return;
-        const { icons: map, pending } = await agentBridge
-          .getIcons(missing)
-          .catch(() => ({ icons: new Map<string, string>(), pending: [] as string[] }));
-        if (map.size > 0) {
-          const apply = (list: AppEntry[]) =>
-            list.map((e) => {
-              const icon = map.get(e.packageName);
-              if (!icon) return e;
-              const cached = iconCache.get(e.packageName);
-              iconCache.set(e.packageName, {
-                label: e.label,
-                icon,
-                ...(e.component ? { component: e.component } : {}),
-                ...(cached?.component && !e.component ? { component: cached.component } : {}),
-              });
-              return { ...e, icon };
-            });
-          const st = get();
-          set({ userApps: apply(st.userApps), systemApps: apply(st.systemApps) });
-          scheduleIconCacheSave();
-          pendingRounds = 0;
-          idleRounds = 0;
-          // respiro entre lotes: el agente genera en fondo y por USB
-          // nunca debe haber ráfagas (v3 — gentil con el teléfono)
-          await new Promise((r) => setTimeout(r, 350));
-        } else if (pending.length > 0 && pendingRounds < 90) {
-          // v11: el agente está generando esos íconos en su hilo de fondo
-          // (serializado, baja prioridad) → esperar con paciencia real
-          pendingRounds++;
-          await new Promise((r) => setTimeout(r, 2_000));
-        } else if (idleRounds < 3) {
-          // sin pendientes declarados pero sin datos → un par de intentos
-          // más (p.ej. el lote siguiente aún no encolado) y salir
-          idleRounds++;
-          await new Promise((r) => setTimeout(r, 3_000));
-        } else {
-          return; // nada útil → no insistir (el re-kick del loop sigue vivo)
+      // persistir labels + íconos (caché localStorage — al
+      // reconectar el drawer nace con íconos genuinos, instantáneo)
+      let iconCount = 0;
+      for (const a of pkg.apps) {
+        if (a.icon) {
+          iconCount++;
+          iconCache.set(a.packageName, {
+            label: a.label,
+            icon: a.icon,
+            ...(a.component ? { component: a.component } : {}),
+          });
         }
       }
+      scheduleIconCacheSave();
+
+      // launcher predefinido (informativo — v10.1: NO decide el HOME)
+      if (pkg.launcher?.defaultComponent && !get().defaultLauncherComponent) {
+        set({ defaultLauncherComponent: pkg.launcher.defaultComponent });
+      }
+
+      // notificaciones (snapshot incluido en el paquete)
+      if (pkg.notifications) {
+        set({
+          notifications: pkg.notifications.notifications,
+          notifListenerEnabled: pkg.notifications.enabled,
+        });
+        if (notifFirstLoad) {
+          for (const n of pkg.notifications.notifications) seenNotifKeys.add(n.key);
+          notifFirstLoad = false;
+        }
+      }
+
+      agentPkgAt = Date.now();
+
+      if (pkg.partial) {
+        // el agente entregó lo que tenía antes de terminar → re-pedir
+        get().toast(
+          `Paquete parcial (${pkg.apps.length} apps) — completando…`,
+          "info",
+        );
+        setTimeout(() => void useStore.getState().syncAgentPackage(true), 20_000);
+        return; // NO hibernar: aún está construyendo
+      }
+
+      // paquete completo recibido → dormir al agente YA
+      void agentBridge.hibernate().catch(() => undefined);
+      get().toast(
+        `Paquete completo: ${pkg.apps.length} apps · ${iconCount} íconos — agente hibernando ✓`,
+        "success",
+      );
+    } catch {
+      /* el próximo checkAgent reintenta */
     } finally {
-      iconSyncBusy = false;
+      agentPkgBusy = false;
     }
   },
 
   /**
-   * v9: refresca el ESPEJO DE NOTIFICACIONES del teléfono. La primera
-   * carga no avisa (evita una ráfaga de toasts al conectar); después,
-   * cada notificación NUEVA muestra un toast estilo escritorio.
+   * v9→v12: refresca el ESPEJO DE NOTIFICACIONES del teléfono — SOLO
+   * BAJO DEMANDA (al abrir el centro de notificaciones o manualmente).
+   * Si el agente estaba hibernando, getNotifications lo despierta un
+   * instante por ADB (requestLive). La primera carga no avisa (evita
+   * una ráfaga de toasts al conectar); después, cada notificación
+   * NUEVA muestra un toast estilo escritorio.
    */
   refreshNotifications: async () => {
     const s = get();
@@ -1904,24 +1873,15 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v9: componente del launcher PREDETERMINADO del teléfono — el sitio al
-   * que SIEMPRE vuelve el botón HOME. Fuente exacta: el agente (PackageManager
-   * .resolveActivity HOME); fallback: `cmd package resolve-activity` por shell.
+   * v12: componente del launcher PREDETERMINADO del teléfono — sitio
+   * al que vuelve el HOME del TELÉFONO (informativo desde v10.1: NO
+   * decide el HOME del escritorio). Fuentes: el PAQUETE ÚNICO del
+   * agente (ya aplicado en el estado) → `cmd package resolve-activity`
+   * por shell. El agente hiberna: no se le pregunta nada aquí.
    */
   resolveHomeLauncher: async () => {
     const cached = get().defaultLauncherComponent;
     if (cached) return cached;
-    if (get().agentStatus === "connected") {
-      try {
-        const l = await agentBridge.getLauncher();
-        if (l?.defaultComponent) {
-          set({ defaultLauncherComponent: l.defaultComponent });
-          return l.defaultComponent;
-        }
-      } catch {
-        /* caer al shell */
-      }
-    }
     try {
       const out = await webAdb.shellSafe(
         "cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN 2>/dev/null | tail -1",
@@ -1971,31 +1931,19 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v8: tecla de navegación dirigida al display virtual — ahora con
-   * CUÁDRUPLE estrategia (fix definitivo del «ATRÁS a medias»):
+   * v8→v12: tecla de navegación dirigida al display virtual —
+   * TRIPLE estrategia (el agente ya NO participa — v5 sin
+   * accesibilidad, multitarea 100 % ADB):
    * 1) `input -d <vd> keyevent <code>` — evento con setDisplayId al
    *    display virtual (fiable, Android 10+)
-   * 2) DexPort Agent `action.back/home/…` — performGlobalAction sobre
-   *    la ventana enfocada (funciona aunque el input -d falle)
-   * 3) canal de control scrcpy (keycode al display espejado)
-   * 4) input keyevent plano (último recurso)
+   * 2) canal de control scrcpy (keycode al display espejado)
+   * 3) input keyevent plano (último recurso)
    */
   sendNavKey: async (keycode) => {
     const vd = get().displayId;
     if (vd != null && vd > 0) {
       const ok = await webAdb.inputKeyeventOnDisplay(keycode, vd);
       if (ok) return;
-    }
-    // 2) agente: performGlobalAction (ATRÁS=4 HOME=3 RECIENTES…)
-    if (get().agentStatus === "connected") {
-      const AGENT_KEYS: Record<number, "back" | "home" | "recents" | "notifications"> = {
-        4: "back",
-        3: "home",
-        82: "recents",
-        83: "notifications",
-      };
-      const action = AGENT_KEYS[keycode];
-      if (action && (await agentBridge.performAction(action))) return;
     }
     const controller = displayEngine.controller;
     if (controller) {
@@ -2245,7 +2193,6 @@ export const useStore = create<DexPortState>((set, get) => ({
       agentStatus: "checking",
       agentPing: null,
       agentInstall: { phase: "idle", progress: 0, message: "" },
-      agentTasks: [],
       // v9
       agentAppsSynced: false,
       notifications: [],
@@ -2422,10 +2369,10 @@ function startTelemetryLoop(): void {
     const s = useStore.getState();
     if (s.phase === "desktop" && !s.reconnecting && !s.suspended) {
       void s.refreshTelemetry();
-      // v9: espejo de notificaciones cada 5s (con el agente conectado)
-      if (s.agentStatus === "connected") {
-        void s.refreshNotifications();
-      }
+      // v12: el espejo de notificaciones ya NO se sondea cada 5 s —
+      // se refresca SOLO al abrir el centro de notificaciones
+      // (NotificationCenter) o con el botón de refresco. El agente
+      // queda hibernando: cero tráfico USB continuo.
     }
   }, 5000);
 }
@@ -2446,21 +2393,11 @@ function startAppMonitorLoop(): void {
     const s = useStore.getState();
     if (s.phase === "desktop" && !s.reconnecting && !s.suspended && s.displayId != null) {
       void s.refreshRunningApps();
-      // v8: reintentar el agente cada ~24s si no está conectado
+      // v12: reintentar el agente cada ~24s SOLO si no conectó aún
+      // (con el paquete entregado, el agente hiberna y no se toca más)
       tick++;
       if (s.agentStatus !== "connected" && s.agentStatus !== "disabled" && tick % 6 === 0) {
         void s.checkAgent();
-      }
-      // v11: AUTORREPARACIÓN de la fuente real del agente — si la lista
-      // quedó a medias o faltan íconos (p.ej. primera enumeración lenta),
-      // re-kickear el sync cada ~20-32s hasta que esté completa
-      if (s.agentStatus === "connected") {
-        if (!s.agentAppsSynced && tick % 5 === 0) {
-          void s.syncAgentApps();
-        } else if (tick % 8 === 0) {
-          const anyMissingIcon = [...s.userApps, ...s.systemApps].some((a) => !a.icon);
-          if (anyMissingIcon) void s.syncAgentIcons();
-        }
       }
     }
   }, 4000);

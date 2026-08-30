@@ -411,6 +411,151 @@ public final class AppRegistry {
     }
 
     // ═════════════════════════════════════════════════════════
+    // v5: package.get — EL PAQUETE ÚNICO
+    // ═════════════════════════════════════════════════════════
+
+    /** Guardado por packageLock. */
+    private final Object packageLock = new Object();
+    private volatile JSONObject packageCache = null;
+    private volatile long packageBuiltAt = 0;
+    private boolean packageBuilding = false; // solo bajo packageLock
+
+    /**
+     * v5: TODO lo que la web necesita en UNA respuesta — apps
+     * lanzables con TODOS los íconos ya renderizados + launcher.
+     *
+     * El paquete lo construye el ÚNICO hilo de fondo (enumerar apps
+     * + renderizar TODOS los íconos con respiros de 20 ms). Este
+     * método es un LONG-POLL: espera hasta {@code waitMs} a que el
+     * worker publique el paquete completo → la web hace UNA sola
+     * solicitud, sin lotes ni reintentos ni polling.
+     *
+     * Si el cache tiene <30 s se reutiliza tal cual; si vence,
+     * se reconstruye. Timeout → devuelve lo que haya con
+     * partial=true (la web puede re-pedirlo).
+     */
+    public JSONObject packageJson(long waitMs) {
+        synchronized (packageLock) {
+            boolean stale = packageCache == null
+                    || System.currentTimeMillis() - packageBuiltAt > 30_000;
+            if (!packageBuilding && stale) {
+                packageBuilding = true;
+                packageCache = null;
+                submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        JSONObject built = null;
+                        try {
+                            refreshApps();
+                            renderAllIcons();
+                            JSONObject p = new JSONObject();
+                            p.put("apps", appsWithIconsJson());
+                            p.put("launcher", launcherStateJson());
+                            p.put("built_at", System.currentTimeMillis());
+                            built = p;
+                        } catch (Throwable ignored) {
+                        }
+                        synchronized (packageLock) {
+                            packageCache = built != null ? built : packageCache;
+                            if (built != null) {
+                                packageBuiltAt = System.currentTimeMillis();
+                            }
+                            packageBuilding = false;
+                            packageLock.notifyAll();
+                        }
+                    }
+                });
+            }
+        }
+        long deadline = System.currentTimeMillis() + Math.max(0, waitMs);
+        synchronized (packageLock) {
+            while (packageCache == null && System.currentTimeMillis() < deadline) {
+                try {
+                    long left = deadline - System.currentTimeMillis();
+                    packageLock.wait(Math.min(2_000, Math.max(1, left)));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        JSONObject out = packageCache;
+        if (out == null) {
+            // timeout: parcial con lo que exista (apps quizá sin íconos)
+            out = new JSONObject();
+            try {
+                out.put("apps", appsCache);
+                out.put("launcher", launcherStateJson());
+                out.put("partial", true);
+            } catch (Exception ignored) {
+            }
+        }
+        return out;
+    }
+
+    /** SOLO el hilo de fondo: renderiza TODOS los íconos que falten. */
+    private void renderAllIcons() {
+        List<App> snapshot = new ArrayList<>(apps.values());
+        for (App a : snapshot) {
+            if (a == null) {
+                continue;
+            }
+            long now = System.currentTimeMillis();
+            if (a.icon != null && now - a.iconAt < ICON_TTL_MS) {
+                continue;
+            }
+            if (a.iconFails >= MAX_ICON_FAILS) {
+                continue;
+            }
+            String b64 = renderIcon(a.pkg);
+            if (b64 != null) {
+                a.icon = b64;
+                a.iconAt = System.currentTimeMillis();
+                a.iconFails = 0;
+            } else {
+                a.iconFails++;
+            }
+            // respiro: el worker NUNCA acapara la CPU del teléfono
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /** Apps con ícono embebido (PNG base64 64 px) para el paquete v5. */
+    private JSONArray appsWithIconsJson() {
+        JSONArray out = new JSONArray();
+        List<App> snapshot = new ArrayList<>(apps.values());
+        Collections.sort(snapshot, new Comparator<App>() {
+            @Override
+            public int compare(App a, App b) {
+                return a.label.compareToIgnoreCase(b.label);
+            }
+        });
+        for (App a : snapshot) {
+            if (a == null || a.component == null || a.component.isEmpty()) {
+                continue; // solo apps LANZABLES (con componente exacto)
+            }
+            try {
+                JSONObject o = new JSONObject();
+                o.put("package_name", a.pkg);
+                o.put("label", a.label);
+                o.put("component", a.component);
+                o.put("system", a.system);
+                if (a.icon != null) {
+                    o.put("icon", a.icon);
+                }
+                out.put(o);
+            } catch (Exception ignored) {
+            }
+        }
+        return out;
+    }
+
+    // ═════════════════════════════════════════════════════════
     // Lookups cacheados (notificaciones) — sin binder jamás
     // ═════════════════════════════════════════════════════════
 

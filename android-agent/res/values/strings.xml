@@ -2,5 +2,4 @@
 <resources>
     <string name="app_name">DexPort Agent</string>
     <string name="notif_listener_name">DexPort Agent · Notificaciones</string>
-    <string name="acc_description">Permite que DexPort (en el navegador) vea las apps y ventanas abiertas del teléfono y del escritorio virtual, con qué app está enfocada en cada pantalla, y envíe acciones de navegación (Atrás, Inicio, Recientes) de forma fiable. No recopila datos: todo queda en tu dispositivo.</string>
 </resources>

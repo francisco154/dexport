@@ -1,19 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  DexPort Agent — manifiesto (v3)
+  DexPort Agent — manifiesto (v5)
   ════════════════════════════════════════════════════════════
-  App auxiliar del proyecto DexPort (web). v3 RECONSTRUIDA para no
-  interferir jamás con el rendimiento del teléfono:
+  App auxiliar del proyecto DexPort (web). v5 — ARQUITECTURA
+  «PAQUETE ÚNICO + HIBERNACIÓN»:
 
-    · servicio de accesibilidad LIGERO (solo eventos de cambio de
-      ventana, sin prefetch de nodos, sin getRoot)
-    · TODO el trabajo pesado (enumerar apps, labels, íconos) pasa por
-      UN solo hilo de fondo de baja prioridad — nunca el hilo principal
-      ni los hilos del servidor TCP
-    · lista COMPLETA de apps instaladas (QUERY_ALL_PACKAGES + <queries>;
-      Android 11+ filtra los paquetes visibles si no se declaran)
-    · espejo de notificaciones con snapshot VIVO en memoria (sin
-      getActiveNotifications() en cada consulta)
+    · SIN servicio de accesibilidad (eliminado para siempre):
+      ya no toca el foco, el táctil ni la multitarea del teléfono.
+      Toda la detección de apps abiertas y la navegación las hace
+      la web por ADB shell (dumpsys / input keyevent).
+    · El puente TCP 127.0.0.1:8458 vive en un servicio EN PRIMER
+      PLANO (AgentServerService) que DexPort enciende/apaga POR
+      ADB. Sin requests 90 s (o tras entregar el paquete) →
+      HIBERNA: servidor apagado, notificación fuera, cero consumo.
+    · Una ÚNICA solicitud `package.get` entrega apps + TODOS los
+      íconos + launcher; luego la web manda `agent.hibernate`.
+    · El espejo de notificaciones (NotificationListenerService)
+      sigue pasivo: el sistema lo empuja, cero costo en reposo.
 
   La web lo consulta vía adb.createSocket("tcp:8458").
 -->
@@ -23,12 +26,18 @@
     <!-- ServerSocket localhost:8458 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- v3: lista COMPLETA de apps. App sideloaded por ADB (no Play
+    <!-- lista COMPLETA de apps. App sideloaded por ADB (no Play
          Store): el permiso QUERY_ALL_PACKAGES está permitido para uso
          propio/dispositivo personal, que es exactamente este caso. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
-    <!-- v3: visibilidad total de apps lanzables (redundante con lo de
+    <!-- v5: servicio en primer plano que aloja el puente (se apaga
+         solo al hibernar — consumo real solo mientras sirve el
+         paquete a la web) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- visibilidad total de apps lanzables (redundante con lo de
          arriba, pero explícito para queryIntentActivities en 11+) -->
     <queries>
         <intent>
@@ -56,20 +65,22 @@
             </intent-filter>
         </activity>
 
+        <!-- v5: PUENTE — servicio en primer plano (specialUse en API
+             34+). Lo arranca DexPort por ADB con
+             `am start-foreground-service -n com.dexport.agent/.AgentServerService`
+             y muere solo (hibernación) tras 90 s ocioso o cuando la
+             web confirma la recepción del paquete. Sin intent-filter:
+             solo intents explícitos. -->
         <service
-            android:name=".AgentAccessibilityService"
-            android:exported="false"
-            android:label="@string/app_name"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
+            android:name=".AgentServerService"
+            android:exported="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Puente USB local 127.0.0.1 para DexPort (paquete de apps/íconos, se hiberna solo)" />
         </service>
 
-        <!-- v2+: espejo de notificaciones (se activa por ADB con
+        <!-- espejo de notificaciones (se activa por ADB con
              `cmd notification allow_listener com.dexport.agent/.AgentNotificationListener`) -->
         <service
             android:name=".AgentNotificationListener"

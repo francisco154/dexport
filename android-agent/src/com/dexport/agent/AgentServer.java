@@ -1,6 +1,6 @@
 package com.dexport.agent;
 
-import android.accessibilityservice.AccessibilityService;
+import android.content.Context;
 import android.os.Build;
 import android.os.Process;
 import android.util.Log;
@@ -25,30 +25,35 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * DexPort Agent v3 — servidor TCP (localhost:8458).
+ * DexPort Agent v5 — servidor TCP (localhost:8458).
  * ════════════════════════════════════════════════════════════
  * Protocolo de líneas JSON (una conexión por request):
  *   request :  {"type": "<cmd>", "id": "<n>"}\n
  *   response:  {"status": "success", ..., "id": "<n>"}\n
  * La web llega por adb.createSocket("tcp:8458").
  *
- * v3 — IMPOSIBLE CONGELAR EL TELÉFONO:
- *  · pool FIJO de 2 hilos (la v2 usaba newCachedThreadPool ILIMITADO:
- *    con consultas lentas se apilaban hilos y saturaba el proceso).
- *  · TODOS los handlers son instantáneos: leen caches volátiles
- *    precalculados por el hilo de fondo (nunca PackageManager ni
- *    binder pesado en el camino del request).
- *  · rate-guard: >30 requests/seg se rechazan (cliente desbocado).
- *  · ping informa user_id: si el agente quedó corriendo en un perfil
- *    de trabajo (Island), la web lo detecta y avisa.
+ * v5 — PAQUETE ÚNICO + HIBERNACIÓN (sin servicio de accesibilidad):
+ *  · `package.get` — TODO lo que la web necesita en UNA respuesta:
+ *    apps lanzables + TODOS los íconos + launcher. El agente
+ *    construye el paquete en su único hilo de fondo y la llamada
+ *    espera (long-poll del lado del agente) hasta que está COMPLETO
+ *    → la web hace UNA única solicitud, sin lotes ni reintentos.
+ *  · `agent.hibernate` — la web lo envía al recibir el paquete:
+ *    el servidor se APAGA (notificación fuera, servicio muerto).
+ *    También hiberna solo tras 90 s sin requests (watchdog del
+ *    AgentServerService).
+ *  · pool FIJO de 3 hilos (1 puede quedar esperando el paquete).
+ *  · rate-guard: >30 requests/seg se rechazan.
+ *  · ping informa user_id (perfil de trabajo/Island) y version:5.
  *
- * Comandos v1: ping · tasks.get_all · windows.get_all · events.recent ·
- *              foreground.get · action.back|home|recents|notifications|
- *              quick_settings|lock_screen|all_apps
- * Comandos v2+: apps.get · icons.get · launcher.get · notifications.get ·
- *               notification.dismiss · notifications.clear_all
- * v3: apps.get/icons.get devuelven "pending" (el fondo aún está
- *     calculando — la web reintente en ~1.5s).
+ * ELIMINADO en v5 (multitarea y navegación = 100 % ADB shell):
+ *  tasks.get_all · windows.get_all · events.recent · foreground.get ·
+ *  action.back|home|recents|notifications|quick_settings|lock_screen|all_apps
+ *
+ * Comandos v5: ping · package.get · agent.hibernate ·
+ *              notifications.get · notification.dismiss ·
+ *              notifications.clear_all · launcher.get · apps.get ·
+ *              icons.get (compat)
  */
 public class AgentServer extends Thread {
 
@@ -56,24 +61,44 @@ public class AgentServer extends Thread {
     private static final String TAG = "DexPortAgent";
     private static final int MAX_REQ_PER_SEC = 30;
 
-    private final AgentAccessibilityService service;
+    /** Callback para apagar el servicio cuando la web pide hibernar. */
+    public interface Hibernator {
+        void hibernateNow();
+    }
+
+    private final Context appCtx;
+    private final Hibernator hibernator;
     private volatile boolean running = false;
     private volatile ServerSocket serverSocket;
-    /** v3: pool FIJO — nunca más hilos que esto. */
-    private final ExecutorService pool = Executors.newFixedThreadPool(2);
+    /** v5: pool FIJO — nunca más hilos que esto. */
+    private final ExecutorService pool = Executors.newFixedThreadPool(3);
 
     /** rate-guard: requests en la ventana actual + inicio de ventana. */
     private final AtomicInteger reqWindow = new AtomicInteger(0);
     private final AtomicLong windowStart = new AtomicLong(0);
 
-    public AgentServer(AgentAccessibilityService service) {
+    /** v5: último request atendido (watchdog de hibernación). */
+    private volatile long lastRequestAt = System.currentTimeMillis();
+
+    public AgentServer(Context appCtx, Hibernator hibernator) {
         super("DexPortAgentServer");
-        this.service = service;
+        this.appCtx = appCtx;
+        this.hibernator = hibernator;
         setDaemon(true);
     }
 
     public boolean isRunning() {
         return running;
+    }
+
+    /** v5: señal de actividad para el watchdog de hibernación. */
+    public void touch() {
+        lastRequestAt = System.currentTimeMillis();
+    }
+
+    /** v5: ms desde el último request atendido. */
+    public long idleFor() {
+        return System.currentTimeMillis() - lastRequestAt;
     }
 
     @Override
@@ -82,7 +107,7 @@ public class AgentServer extends Thread {
         try {
             // solo localhost: la web llega a través del túnel ADB
             serverSocket = new ServerSocket(PORT, 16, InetAddress.getLoopbackAddress());
-            Log.i(TAG, "Agent v3 escuchando en 127.0.0.1:" + PORT);
+            Log.i(TAG, "Agent v5 escuchando en 127.0.0.1:" + PORT);
             while (running) {
                 final Socket client = serverSocket.accept();
                 try {
@@ -144,6 +169,7 @@ public class AgentServer extends Thread {
             if (line == null || line.trim().isEmpty()) {
                 return;
             }
+            touch();
             if (!rateOk()) {
                 write(client, error(null, "rate limit"));
                 return;
@@ -157,6 +183,16 @@ public class AgentServer extends Thread {
             }
             String cmd = req.optString("type", req.optString("command", ""));
             write(client, dispatch(cmd, req));
+            // v5: hibernación explícita — dar un respiro para que la
+            // respuesta cruce el túnel USB y apagar el puente
+            if ("agent.hibernate".equals(cmd) && hibernator != null) {
+                try {
+                    Thread.sleep(400);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                hibernator.hibernateNow();
+            }
         } catch (Exception ignored) {
         } finally {
             closeQuietly(client);
@@ -191,45 +227,48 @@ public class AgentServer extends Thread {
         try {
             res.put("id", id);
             res.put("status", "success");
+            // v5: la multitarea y la navegación viven 100 % en ADB
+            if (cmd.startsWith("action.")
+                    || "tasks.get_all".equals(cmd)
+                    || "windows.get_all".equals(cmd)
+                    || "events.recent".equals(cmd)
+                    || "foreground.get".equals(cmd)) {
+                res.put("status", "error");
+                res.put("error", "eliminado en v5 — multitarea y navegación 100% por ADB");
+                return res;
+            }
             switch (cmd == null ? "" : cmd) {
                 case "ping": {
                     res.put("service", "DexPort Agent");
-                    res.put("version", 4);
+                    res.put("version", 5);
                     res.put("sdk", Build.VERSION.SDK_INT);
                     res.put("android", Build.VERSION.RELEASE);
                     res.put("device", Build.MANUFACTURER + " " + Build.MODEL);
                     res.put("multi_display", Build.VERSION.SDK_INT >= 33);
                     res.put("notifications", AgentNotificationListener.isConnected());
-                    // v3: perfil en el que corre (0 = principal). Si la app
-                    // quedó duplicada en un perfil de trabajo (Island) la
-                    // web lo ve y la reinstala limpia.
+                    // v5: este agente entrega un paquete y HIBERNA
+                    res.put("hibernates", true);
+                    // perfil en el que corre (0 = principal). Si la app
+                    // quedó duplicada en un perfil de trabajo (Island)
+                    // la web lo ve y la reinstala limpia.
                     res.put("user_id", Process.myUid() / 100_000);
                     break;
                 }
-                case "apps.get": {
-                    JSONObject state = AppRegistry.get(service).appsStateJson();
-                    res.put("apps", state.optJSONArray("apps"));
-                    res.put("pending", state.optBoolean("pending", false));
+                case "package.get": {
+                    // v5: EL PAQUETE — apps + TODOS los íconos + launcher
+                    // en UNA respuesta (long-poll hasta ~165 s mientras
+                    // el único hilo de fondo termina de renderizar).
+                    JSONObject pkg = AppRegistry.get(appCtx).packageJson(165_000);
+                    res.put("package", pkg);
+                    // snapshot de notificaciones incluido: con esto la
+                    // web NO necesita NINGÚN otro request
+                    res.put("notifications", AgentNotificationListener.snapshotJson(
+                            AgentNotificationListener.getInstance()));
                     break;
                 }
-                case "icons.get": {
-                    List<String> pkgs = new ArrayList<>();
-                    JSONArray arr = req.optJSONArray("packages");
-                    if (arr != null) {
-                        for (int i = 0; i < arr.length() && i < 16; i++) {
-                            String p = arr.optString(i, "");
-                            if (!p.isEmpty()) {
-                                pkgs.add(p);
-                            }
-                        }
-                    }
-                    JSONObject icons = AppRegistry.get(service).iconsStateJson(pkgs);
-                    res.put("icons", icons.optJSONArray("icons"));
-                    res.put("pending", icons.optJSONArray("pending"));
-                    break;
-                }
-                case "launcher.get": {
-                    res.put("launcher", AppRegistry.get(service).launcherStateJson());
+                case "agent.hibernate": {
+                    // la web ya recibió el paquete → dormir YA
+                    res.put("performed", true);
                     break;
                 }
                 case "notifications.get": {
@@ -254,55 +293,32 @@ public class AgentServer extends Thread {
                     res.put("performed", ok);
                     break;
                 }
-                case "tasks.get_all": {
-                    res.put("tasks", service.tasksJson());
+                case "launcher.get": {
+                    res.put("launcher", AppRegistry.get(appCtx).launcherStateJson());
                     break;
                 }
-                case "windows.get_all": {
-                    res.put("windows", service.windowsJson());
+                case "apps.get": {
+                    // compat v≤4 (respuesta instantánea de caches)
+                    JSONObject state = AppRegistry.get(appCtx).appsStateJson();
+                    res.put("apps", state.optJSONArray("apps"));
+                    res.put("pending", state.optBoolean("pending", false));
                     break;
                 }
-                case "events.recent": {
-                    res.put("events", service.eventsJson());
-                    break;
-                }
-                case "foreground.get": {
-                    res.put("foreground", service.foregroundJson());
-                    break;
-                }
-                case "action.back": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_BACK));
-                    break;
-                }
-                case "action.home": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_HOME));
-                    break;
-                }
-                case "action.recents": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_RECENTS));
-                    break;
-                }
-                case "action.notifications": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS));
-                    break;
-                }
-                case "action.quick_settings": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS));
-                    break;
-                }
-                case "action.lock_screen": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN));
-                    break;
-                }
-                case "action.all_apps": {
-                    res.put("performed", service.performGlobal(
-                            AccessibilityService.GLOBAL_ACTION_ACCESSIBILITY_ALL_APPS));
+                case "icons.get": {
+                    // compat v≤4
+                    List<String> pkgs = new ArrayList<>();
+                    JSONArray arr = req.optJSONArray("packages");
+                    if (arr != null) {
+                        for (int i = 0; i < arr.length() && i < 16; i++) {
+                            String p = arr.optString(i, "");
+                            if (!p.isEmpty()) {
+                                pkgs.add(p);
+                            }
+                        }
+                    }
+                    JSONObject icons = AppRegistry.get(appCtx).iconsStateJson(pkgs);
+                    res.put("icons", icons.optJSONArray("icons"));
+                    res.put("pending", icons.optJSONArray("pending"));
                     break;
                 }
                 default:

@@ -9,6 +9,28 @@ teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
 > 🔗 **Demo en vivo:** <https://dexport-mu.vercel.app>
 
+> 🚀 **v12** — **DexPort Agent v5: paquete único + hibernación + multitarea 100 % ADB**:
+> · **UNA frecuencia, leída UNA vez** — al conectar, la web pide un único
+>   `package.get` con TODO (apps lanzables + TODOS los íconos + launcher +
+>   notificaciones); el agente retiene la respuesta hasta tener el paquete
+>   COMPLETO (long-poll interno). Recibido el paquete → `agent.hibernate` →
+>   el puente TCP se APAGA: notificación fuera, servicio muerto, cero
+>   consumo de CPU/batería. Sin lotes, sin reintentos, sin polling.
+> · **SIN servicio de accesibilidad (eliminado)** — la detección de apps
+>   abiertas, el foco por display y Atrás/Inicio/Recientes son ahora 100 %
+>   ADB shell (dumpsys + input -d): imposible que el agente interfiera con
+>   el teléfono (fix definitivo del «no puedo abrir apps en mi teléfono»).
+> · **Despertar por ADB** — `am start-foreground-service` enciende el
+>   puente cuando la web lo necesita (al conectar o al abrir el centro de
+>   notificaciones); tras 90 s ocioso hiberna solo.
+> · **Notificaciones BAJO DEMANDA** — ya NO se sondean cada 5 s: se
+>   refrescan al abrir el centro de notificaciones (y cada 12 s mientras
+>   esté abierto). Cerrado el panel: cero tráfico del agente.
+> · **Estabilidad** — con el agente dormido y cero polling, desaparecen de
+>   raíz las fugas que congelaban el navegador a los 20-30 min. El agente
+>   v1-v4 se auto-actualiza solo a v5 (y limpia el rastro de la vieja
+>   accesibilidad: tu teléfono queda 100 % libre).
+
 > 🚀 **v11** — **DexPort Agent v4 + «Liberar teléfono» + estabilidad de sesión larga**:
 > · **Fix de los íconos a medias** — el `icons.get` del agente ahora agenda
 >   el drenaje del worker por cada lote (antes solo se drenaba en el arranque:
