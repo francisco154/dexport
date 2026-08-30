@@ -365,9 +365,12 @@ export function DevicePanel() {
 /** ── Ajustes del display virtual (v6: pantalla, personalización, calidad) ── */
 
 /**
- * v8→v9: sección del DexPort Agent — estado + instalación + explicación.
+ * v8→v11: sección del DexPort Agent — estado + instalación + explicación.
  * v2: detección EXACTA de apps/ventanas + íconos y nombres reales +
  * espejo de notificaciones + info del launcher predefinido del teléfono.
+ * v11: se puede DESACTIVAR (modo solo ADB) o desinstalar — el escritorio
+ * funciona sin él (dumpsys + pm list), solo que sin íconos reales ni
+ * espejo de notificaciones.
  */
 function AgentSettingsSection() {
   const agentStatus = useStore((s) => s.agentStatus);
@@ -377,6 +380,9 @@ function AgentSettingsSection() {
   const checkAgent = useStore((s) => s.checkAgent);
   const notifListenerEnabled = useStore((s) => s.notifListenerEnabled);
   const notifications = useStore((s) => s.notifications);
+  const agentDisabled = useStore((s) => s.agentDisabled);
+  const setAgentDisabled = useStore((s) => s.setAgentDisabled);
+  const uninstallAgent = useStore((s) => s.uninstallAgent);
 
   const busy =
     agentInstall.phase === "downloading" || agentInstall.phase === "pushing" ||
@@ -388,6 +394,7 @@ function AgentSettingsSection() {
     missing: "No instalado",
     "no-permission": "Instalado — falta permiso de accesibilidad",
     connected: "Activo",
+    disabled: "Desactivado — modo solo ADB",
     unknown: "Desconocido",
   };
   const statusColor: Record<string, string> = {
@@ -395,6 +402,7 @@ function AgentSettingsSection() {
     missing: "text-[#f59e0b]",
     "no-permission": "text-[#f59e0b]",
     connected: "text-[#3ddc84]",
+    disabled: "text-[#9499a3]",
     unknown: "text-[#9499a3]",
   };
 
@@ -402,7 +410,7 @@ function AgentSettingsSection() {
     <>
       <h3 className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         <Radar size={13} className="text-sky-300/70" />
-        DexPort Agent v3 · detección + íconos + notificaciones
+        DexPort Agent v4 · detección + íconos + notificaciones
       </h3>
       <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-sky-400/15 bg-sky-400/5 p-4">
         <div className="flex items-center justify-between gap-3">
@@ -419,6 +427,10 @@ function AgentSettingsSection() {
           {agentStatus === "connected" ? (
             <span className="flex items-center gap-1.5 rounded-full bg-[#3ddc84]/15 px-3 py-1.5 text-[11.5px] font-semibold text-[#3ddc84]">
               <ShieldCheck size={13} /> OK
+            </span>
+          ) : agentDisabled ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11.5px] font-semibold text-[#9499a3]">
+              <Radar size={13} /> OFF
             </span>
           ) : busy ? (
             <span className="flex items-center gap-2 rounded-full bg-sky-400/10 px-3 py-1.5 text-[11.5px] text-sky-200">
@@ -477,13 +489,60 @@ function AgentSettingsSection() {
           nombres reales de TODAS las apps instaladas, las notificaciones activas
           del teléfono (centro de notificaciones del escritorio) y el launcher
           predefinido del teléfono — informativo, para elegirlo en el selector
-          si lo prefieres para el escritorio. v3
-          reconstruido para no frenar NUNCA el teléfono: servicio de
-          accesibilidad ultraligero, todo el trabajo pesado en un hilo de fondo
-          y solo en el perfil principal (sin duplicados en Island). Se instala
-          y recibe todos sus permisos por ADB — sin tocar el teléfono. Todo
-          queda en tu dispositivo (USB).
+          si lo prefieres para el escritorio. v4: los lotes de íconos se
+          autodrenan en el worker (ya no se quedan a medias), las notificaciones
+          viajan SIN ícono en cada poll (el ícono lo pone la web por paquete —
+          mucho menos tráfico USB) y todo el trabajo pesado sigue en un único
+          hilo de fondo de baja prioridad, solo en el perfil principal (sin
+          duplicados en Island). Se instala y recibe todos sus permisos por ADB
+          — sin tocar el teléfono. Todo queda en tu dispositivo (USB).
         </p>
+
+        {/* v11: control del agente — opcional desde esta versión */}
+        {agentDisabled ? (
+          <div className="flex flex-col gap-2 rounded-xl bg-white/[0.03] p-3">
+            <p className="text-[11.5px] leading-relaxed text-[#aab3bf]">
+              Modo <b className="text-white">solo ADB</b>: el escritorio funciona
+              con comandos shell directos (apps por pm list, tareas por dumpsys),
+              pero sin íconos reales, sin labels exactos y sin espejo de
+              notificaciones. Útil si prefieres cero apps auxiliares.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="btn-solid !py-1.5 !text-[11.5px]"
+                onClick={() => setAgentDisabled(false)}
+              >
+                <Radar size={12} /> Reactivar agente
+              </button>
+              <button
+                className="btn-ghost !py-1.5 !text-[11.5px]"
+                onClick={() => void uninstallAgent()}
+              >
+                Desinstalar del teléfono
+              </button>
+            </div>
+          </div>
+        ) : (
+          agentStatus === "connected" && (
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="btn-ghost !py-1.5 !text-[11.5px]"
+                onClick={() => setAgentDisabled(true)}
+                title="Deja de usar el agente por completo (cero polling). El escritorio sigue funcionando en modo solo ADB."
+              >
+                Desactivar (modo solo ADB)
+              </button>
+              <button
+                className="btn-ghost !py-1.5 !text-[11.5px] !text-[#f0a35e]"
+                onClick={() => void uninstallAgent()}
+                title="pm uninstall com.dexport.agent por ADB"
+              >
+                Desinstalar del teléfono
+              </button>
+            </div>
+          )
+        )}
+
         {agentStatus === "no-permission" && (
           <p className="rounded-xl bg-amber-400/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
             Si «Activar» no lo conecta, abre en el teléfono: Ajustes →
@@ -498,7 +557,7 @@ function AgentSettingsSection() {
             Ajustes → Acceso a notificaciones → DexPort Agent · Notificaciones.
           </p>
         )}
-        {agentStatus !== "connected" && !busy && (
+        {agentStatus !== "connected" && !agentDisabled && !busy && (
           <button
             className="btn-ghost w-fit !py-1.5 !text-[11.5px]"
             onClick={() => void checkAgent()}
@@ -521,6 +580,9 @@ export function SettingsPanel() {
   const toast = useStore((s) => s.toast);
   const reconnectDesktop = useStore((s) => s.reconnectDesktop);
   const resizeDisplayToWindow = useStore((s) => s.resizeDisplayToWindow);
+  const suspendDesktop = useStore((s) => s.suspendDesktop);
+  const suspended = useStore((s) => s.suspended);
+  const phase = useStore((s) => s.phase);
 
   if (!open) return null;
 
@@ -615,6 +677,24 @@ export function SettingsPanel() {
           checked={settings.keepScreenOn}
           onChange={() => void apply({ keepScreenOn: !settings.keepScreenOn })}
         />
+        <Toggle
+          label="Modo ecológico en segundo plano"
+          hint="Si la pestaña queda en segundo plano ~3 minutos, el escritorio se suspende solo (display virtual destruido): tu teléfono queda 100% libre y sin consumo USB. Al volver a la pestaña se reanuda automáticamente."
+          checked={settings.ecoMode}
+          onChange={(v) => setSettings({ ecoMode: v })}
+        />
+        {phase === "desktop" && !suspended && (
+          <button
+            className="glass rounded-xl px-4 py-3 text-left text-[12.5px] font-medium text-amber-200 transition hover:bg-amber-400/10"
+            onClick={() => {
+              togglePanel("settingsOpen", false);
+              void suspendDesktop("manual");
+            }}
+            title="Detiene el motor y DESTRUYE el display virtual: el teléfono queda completamente libre (apps, multitarea, notificaciones) mientras el navegador queda a la espera. «Reanudar» lo reconstruye en segundos."
+          >
+            ⏸ Liberar teléfono (suspender escritorio)
+          </button>
+        )}
         <Toggle
           label="Ocultar teclado virtual en el escritorio"
           hint="El teclado en pantalla no aparece en el display DeX — se escribe con el teclado físico del PC. Se aplica al reconectar."

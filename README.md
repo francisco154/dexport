@@ -9,6 +9,27 @@ teclado) sin instalar nada — solo un navegador con WebUSB (Chrome / Edge).
 
 > 🔗 **Demo en vivo:** <https://dexport-mu.vercel.app>
 
+> 🚀 **v11** — **DexPort Agent v4 + «Liberar teléfono» + estabilidad de sesión larga**:
+> · **Fix de los íconos a medias** — el `icons.get` del agente ahora agenda
+>   el drenaje del worker por cada lote (antes solo se drenaba en el arranque:
+>   los íconos quedaban trabados en los primeros ~6) y la web espera con
+>   paciencia real (~3 min) + autorreparación cada 32 s.
+> · **Notificaciones ligeras** — el poll de 5 s ya NO transporta el PNG
+>   base64 de cada app emisora (decenas de KB repetidos): la web resuelve el
+>   ícono por paquete desde su caché de apps.
+> · **«Liberar teléfono» (suspender escritorio)** — destruye el display
+>   virtual y deja el teléfono 100 % libre (apps, multitarea, split-screen),
+>   con la conexión USB viva: «Reanudar» lo reconstruye en segundos. También
+>   AUTOMÁTICO (modo ecológico): pestaña ~3 min en segundo plano → suspensión
+>   sola; al volver, se reanuda sola.
+> · **Anti-congelamiento del navegador (sesiones 20-30 min)** — cero tráfico
+>   con la pestaña oculta (loops gated), timers del race siempre limpios,
+>   `seenNotifKeys` acotado, y el `dumpsys` pesado se reutiliza 8 s cuando el
+>   agente está conectado (mitad de tráfico USB).
+> · **Agente OPCIONAL** — se puede **Desactivar** (modo solo ADB: dumpsys +
+>   pm list, sin íconos reales ni notificaciones) o **Desinstalar** por ADB,
+>   desde Ajustes. El agente v1-v3 se auto-actualiza solo a v4.
+
 > 🚀 **v9** — **DexPort Agent v2: íconos reales + notificaciones + HOME fijo**:
 > · **Íconos y nombres GENUINOS** — el agente ahora entrega el ícono real
 >   (PNG 64px, drawable del launcher) y la etiqueta exacta del

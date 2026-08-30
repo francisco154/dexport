@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { PauseCircle } from "lucide-react";
 import { DisplayCanvas } from "./DisplayCanvas";
 import { Taskbar, TaskbarPill } from "./Taskbar";
 import { WindowControls } from "./WindowControls";
@@ -125,7 +126,50 @@ export function DesktopShell() {
       {/* v4: pantalla de selección de launcher (modal del escritorio) */}
       <LauncherPicker />
       <ReconnectOverlay />
+      {/* v11: escritorio suspendido — el teléfono quedó libre */}
+      <SuspendOverlay />
       <Toasts />
+    </div>
+  );
+}
+
+/**
+ * v11: SuspendOverlay — visible cuando el escritorio está SUSPENDIDO
+ * («Liberar teléfono» o modo ecológico con la pestaña en segundo plano).
+ * Cubre todo: nada del escritorio responde hasta «Reanudar». La
+ * conexión USB sigue viva → reanudar tarda pocos segundos.
+ */
+function SuspendOverlay() {
+  const suspended = useStore((s) => s.suspended);
+  const reconnecting = useStore((s) => s.reconnecting);
+  const resumeDesktop = useStore((s) => s.resumeDesktop);
+  if (!suspended || reconnecting) return null;
+  return (
+    <div className="fixed inset-0 z-[80] grid place-items-center bg-[#04070c]/96 backdrop-blur-md">
+      <div className="glass-dark mx-4 flex max-w-md flex-col items-center gap-4 rounded-3xl p-8 text-center">
+        <div className="grid h-16 w-16 place-items-center rounded-2xl bg-amber-400/12 ring-1 ring-amber-300/25">
+          <PauseCircle size={30} className="text-amber-300" />
+        </div>
+        <div>
+          <h2 className="font-serif text-3xl italic text-white">Escritorio suspendido</h2>
+          <p className="mt-2 text-[13px] leading-relaxed text-[#aab3bf]">
+            El display virtual fue destruido y tu teléfono quedó
+            <b className="text-white"> completamente libre</b>: las apps del
+            escritorio volvieron al teléfono, la multitarea funciona con
+            normalidad y no hay consumo USB. La conexión sigue viva.
+          </p>
+        </div>
+        <button
+          className="btn-solid !px-6 !py-2.5 !text-[13px]"
+          onClick={() => void resumeDesktop()}
+        >
+          Reanudar escritorio
+        </button>
+        <p className="text-[10.5px] leading-relaxed text-[#5a606c]">
+          La reanudación reconstruye la pantalla virtual en segundos, con el
+          mismo launcher y las apps que quedaron abiertas en el teléfono.
+        </p>
+      </div>
     </div>
   );
 }

@@ -93,7 +93,7 @@ public class MainActivity extends Activity {
                         + "2. El permiso de accesibilidad también se concede por ADB — al activarse, el agente abre su puente local en el puerto 8458.\n\n"
                         + "3. DexPort consulta ese puente para ver las apps y ventanas abiertas (del teléfono y del escritorio virtual), saber cuál está enfocada y enviar Atrás/Inicio/Recientes de forma fiable.\n\n"
                         + "4. Además espeja las NOTIFICACIONES activas (permiso propio por ADB), entrega los ÍCONOS y nombres reales de TODAS las apps instaladas y resuelve el launcher predefinido.\n\n"
-                        + "5. v3 — RECONSTRUIDO para no intervenir NUNCA en el rendimiento: el servicio de accesibilidad es ultraligero (sin inspección de contenido de ventanas) y todo el trabajo pesado pasa por un único hilo de fondo de baja prioridad.\n\n"
+                        + "5. v3-v4 — RECONSTRUIDO para no intervenir NUNCA en el rendimiento: servicio de accesibilidad ultraligero y trabajo pesado en un único hilo de fondo. v4: íconos por lotes que se autodrenan (fix de los íconos a medias) y notificaciones sin ícono en el poll (menos tráfico USB).\n\n"
                         + "6. No sale ningún dato del dispositivo: la conexión pasa por el cable USB (ADB)."));
 
         box.addView(sectionTitle("Privacidad"), sectionLp());
@@ -131,7 +131,7 @@ public class MainActivity extends Activity {
         int userId = android.os.Process.myUid() / 100_000;
         if (enabled) {
             statusLine.setTextColor(0xFF4ADE80);
-            statusLine.setText("● ACTIVO v3 — puente 127.0.0.1:" + AgentServer.PORT
+            statusLine.setText("● ACTIVO v4 — puente 127.0.0.1:" + AgentServer.PORT
                     + "\nAndroid " + sdk + (multi ? " · ventanas por display ✓" : "")
                     + "\nNotificaciones: " + (notif ? "espejadas ✓" : "no concedidas")
                     + "\nPerfil: " + (userId == 0 ? "principal ✓" : ("TRABAJO (" + userId + ") — reinstalá desde DexPort")));

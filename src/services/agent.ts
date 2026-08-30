@@ -33,7 +33,7 @@ export const AGENT_SERVICE = "com.dexport.agent/com.dexport.agent.AgentAccessibi
 export const AGENT_NOTIF_LISTENER = "com.dexport.agent/com.dexport.agent.AgentNotificationListener";
 export const AGENT_APK_URL = "dexport-agent.apk";
 export const AGENT_APK_DEVICE_PATH = "/data/local/tmp/dexport-agent.apk";
-export const AGENT_APK_SIZE = 53_898;
+export const AGENT_APK_SIZE = 53_899;
 
 /** Tarea/app abierta según el agente (ventana TYPE_APPLICATION). */
 export interface AgentTask {
@@ -138,18 +138,20 @@ export class AgentBridge {
     const adb = webAdb.adb;
     if (!adb) throw new Error("Dispositivo no conectado");
     const socket = await adb.createSocket(`tcp:${AGENT_PORT}`);
+    let timer: ReturnType<typeof setTimeout> | null = null;
     try {
       const id = `ag${requestSeq++}`;
       const body = JSON.stringify({ type: command, command, id, ...payload }) + "\n";
       const writer = socket.writable.getWriter();
       await writer.write(new TextEncoder().encode(body));
       writer.releaseLock();
-      const response = await Promise.race([
-        readLine(socket.readable),
-        new Promise<string | null>((_, reject) =>
-          setTimeout(() => reject(new Error("agent timeout")), timeoutMs),
-        ),
-      ]);
+      // v11: el timer del race se limpia SIEMPRE. Antes quedaba un timer
+      // huérfano por petición (cientos por sesión) que, con la pestaña en
+      // segundo plano, Chrome acumulaba y disparaba en ráfaga al volver.
+      const timeoutP = new Promise<string | null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      });
+      const response = await Promise.race([readLine(socket.readable), timeoutP]);
       if (!response) return null;
       try {
         return JSON.parse(response) as Record<string, unknown>;
@@ -157,6 +159,7 @@ export class AgentBridge {
         return null;
       }
     } finally {
+      if (timer) clearTimeout(timer);
       try {
         await socket.close();
       } catch {
@@ -265,9 +268,12 @@ export class AgentBridge {
     };
     let res = await this.request("apps.get", timeoutMs).catch(() => null);
     let apps = parse(res);
-    if (apps.length === 0 && res?.pending === true) {
-      // el fondo del agente aún enumera (~1-2s) → reintento único
-      await sleep(2_000);
+    // v11: la PRIMERA enumeración del agente (cientos de apps, binder
+    // por label + componente) puede tardar decenas de segundos → esperar
+    // con paciencia. Antes: un único reintento y la lista quedaba a medias
+    // (y con ella, los íconos).
+    for (let i = 0; i < 5 && apps.length === 0 && res?.pending === true; i++) {
+      await sleep(2_500);
       res = await this.request("apps.get", timeoutMs).catch(() => null);
       apps = parse(res);
     }
@@ -443,7 +449,7 @@ export class AgentBridge {
     onProgress({
       phase: "downloading",
       progress: 0.05,
-      message: "Descargando DexPort Agent v3 (54 KB)…",
+      message: "Descargando DexPort Agent v4 (54 KB)…",
     });
     const response = await fetch(AGENT_APK_URL);
     if (!response.ok && !response.body) {

@@ -59,6 +59,7 @@ import {
 import { parsePackageList, packageToLabel, type AppEntry } from "../utils/appNames";
 import {
   agentBridge,
+  AGENT_PKG,
   type AgentPing,
   type AgentInstallProgress,
   type AgentTask,
@@ -213,7 +214,7 @@ interface DexPortState {
 
   // ── v8: DexPort Agent (accesibilidad) ──
   /** "checking" | "missing" | "no-permission" | "connected" | "unknown" */
-  agentStatus: "checking" | "missing" | "no-permission" | "connected" | "unknown";
+  agentStatus: "checking" | "missing" | "no-permission" | "connected" | "disabled" | "unknown";
   agentPing: AgentPing | null;
   /** progreso de la instalación (para la UI) */
   agentInstall: AgentInstallProgress;
@@ -229,6 +230,21 @@ interface DexPortState {
   notifListenerEnabled: boolean;
   /** launcher PREDETERMINADO del teléfono (HOME determinista) */
   defaultLauncherComponent: string | null;
+
+  // ── v11: suspensión del escritorio + agente opcional ──
+  /** escritorio suspendido: display virtual destruido, teléfono libre, USB vivo */
+  suspended: boolean;
+  /** agente desactivado por el usuario → modo «solo ADB» (sin íconos reales/notifs) */
+  agentDisabled: boolean;
+
+  /** v11: suspende el escritorio — destruye el display virtual (el teléfono queda 100% libre) */
+  suspendDesktop: (reason?: "auto" | "manual") => Promise<void>;
+  /** v11: reconstruye el display virtual tras una suspensión */
+  resumeDesktop: () => Promise<void>;
+  /** v11: activa/desactiva el uso del DexPort Agent (persistente) */
+  setAgentDisabled: (v: boolean) => void;
+  /** v11: desinstala el agente del teléfono por ADB */
+  uninstallAgent: () => Promise<void>;
 
   // ── Panels ──
   panels: PanelState;
@@ -418,6 +434,25 @@ function saveSettings(s: DisplaySettings): void {
   }
 }
 
+/** v11: agente desactivado por el usuario (persistente — modo solo ADB) */
+const AGENT_DISABLED_KEY = "dexport.agent.disabled.v1";
+
+function loadAgentDisabled(): boolean {
+  try {
+    return localStorage.getItem(AGENT_DISABLED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function saveAgentDisabled(v: boolean): void {
+  try {
+    localStorage.setItem(AGENT_DISABLED_KEY, v ? "1" : "0");
+  } catch {
+    /* noop */
+  }
+}
+
 // Instancia única del motor de display (ScrcpyVideoManager port)
 export const displayEngine = new DisplayEngine();
 
@@ -435,6 +470,8 @@ let notifRefreshBusy = false;
 const seenNotifKeys = new Set<string>();
 let notifFirstLoad = true;
 let toastSeq = 1;
+/** v11: cache del dumpsys de tareas (el comando más pesado del loop) */
+let taskDumpCache = { out: "", at: 0 };
 
 export const useStore = create<DexPortState>((set, get) => ({
   phase: "landing",
@@ -492,6 +529,10 @@ export const useStore = create<DexPortState>((set, get) => ({
   notifications: [],
   notifListenerEnabled: false,
   defaultLauncherComponent: null,
+
+  // ── v11 ──
+  suspended: false,
+  agentDisabled: loadAgentDisabled(),
 
   panels: {
     drawerOpen: false,
@@ -688,6 +729,8 @@ export const useStore = create<DexPortState>((set, get) => ({
         onControllerReady: () => set({ controlOnline: true }),
         onExited: async () => {
           const s = get();
+          // v11: parada voluntaria (suspend) o ya reconectando → no hacer nada
+          if (s.suspended || s.reconnecting) return;
           if (s.phase === "desktop") {
             await s.reconnectDesktop();
           } else if (s.phase === "boot" && !s.bootError) {
@@ -1384,6 +1427,7 @@ export const useStore = create<DexPortState>((set, get) => ({
    * Todo el dump en UN stream con marcadores; el agente en paralelo.
    */
   refreshRunningApps: async () => {
+    if (document.hidden) return; // v11: pestaña oculta → cero tráfico USB
     const vd = get().displayId;
     const agentConnected = get().agentStatus === "connected";
     const agentPromise: Promise<AgentTask[]> = agentConnected
@@ -1391,10 +1435,16 @@ export const useStore = create<DexPortState>((set, get) => ({
       : Promise.resolve([]);
 
     try {
-      const [out, agent] = await Promise.all([
-        webAdb.shellSafe(TASK_DUMP_COMMAND, 15_000),
-        agentPromise,
-      ]);
+      // v11: el dumpsys de actividades es el comando MÁS pesado del loop
+      // (100-200 KB cada 4 s). Con el agente conectado, las tareas frescas
+      // llegan por él cada tick → el dumpsys se reutiliza 8 s (mitad de
+      // tráfico USB) sin perder fiabilidad (taskId/display siguen al día)
+      let out = taskDumpCache.out;
+      if (!agentConnected || Date.now() - taskDumpCache.at > 8_000) {
+        out = await webAdb.shellSafe(TASK_DUMP_COMMAND, 15_000);
+        taskDumpCache = { out, at: Date.now() };
+      }
+      const agent = await agentPromise;
       const { act, win, stack, focus } = splitTaskDump(out);
       const tasks = mergeTaskSources({
         act: parseTasks(act), // foco interno por top de display
@@ -1423,20 +1473,27 @@ export const useStore = create<DexPortState>((set, get) => ({
    *   connected     → puente 8458 responde (permiso activo)
    *   no-permission → APK instalado pero el servicio no está habilitado
    *   missing       → ni siquiera instalado
+   *   disabled      → v11: el usuario lo desactivó (modo solo ADB)
    */
   checkAgent: async () => {
     if (!webAdb.adb) return;
+    // v11: agente desactivado → no usarlo en absoluto (cero polling,
+    // cero upgrades — el escritorio funciona en modo solo ADB)
+    if (get().agentDisabled) {
+      set({ agentStatus: "disabled", agentPing: null, agentTasks: [], notifications: [] });
+      return;
+    }
     set((s) => (s.agentStatus === "connected" ? {} : { agentStatus: "checking" }));
     const pong = await agentBridge.ping();
     if (pong) {
       set({ agentStatus: "connected", agentPing: pong });
-      // v10: el agente v1/v2 se ACTUALIZA solo a v3 (reconstrucción sin
-      // bloqueos: sin getRoot, sin prefetch de nodos, worker único de fondo)
-      if (pong.version < 3) {
+      // v11: el agente v1/v2/v3 se ACTUALIZA solo a v4 (íconos que se
+      // autodrenan + notificaciones sin ícono en el poll = menos USB)
+      if (pong.version < 4) {
         if (!agentUpgradeAttempted) {
           agentUpgradeAttempted = true;
           get().toast(
-            "Actualizando DexPort Agent a v3 — reconstruido para no frenar el teléfono…",
+            "Actualizando DexPort Agent a v4 — íconos completos y menos consumo…",
             "info",
           );
           void get().installAgent();
@@ -1489,6 +1546,10 @@ export const useStore = create<DexPortState>((set, get) => ({
   /** v8: instalar el agente + conceder accesibilidad por ADB (automático). */
   installAgent: async () => {
     if (get().agentInstall.phase === "installing") return;
+    if (get().agentDisabled) {
+      get().toast("El agente está desactivado — reactívalo en Ajustes si quieres usarlo", "info");
+      return;
+    }
     if (!webAdb.adb) {
       get().toast("Conecta el dispositivo primero", "error");
       return;
@@ -1502,7 +1563,7 @@ export const useStore = create<DexPortState>((set, get) => ({
         set({ agentStatus: "connected" });
         const pong = await agentBridge.ping();
         if (pong) set({ agentPing: pong });
-        get().toast("DexPort Agent v2 activo — detección, íconos y notificaciones ✓", "success");
+        get().toast("DexPort Agent v4 activo — detección, íconos y notificaciones ✓", "success");
         void get().refreshRunningApps();
         // v9: sincronizar apps reales + íconos + HOME determinista + notifs
         void get().syncAgentApps();
@@ -1528,6 +1589,117 @@ export const useStore = create<DexPortState>((set, get) => ({
   agentAction: async (a) => {
     if (get().agentStatus !== "connected") return false;
     return agentBridge.performAction(a);
+  },
+
+  // ═════════════════════════════════════════════════════════
+  // v11: SUSPENDER / REANUDAR — «liberar el teléfono»
+  // ═════════════════════════════════════════════════════════
+
+  /**
+   * v11: suspende el escritorio — para el motor scrcpy y DESTRUYE el
+   * display virtual. Mientras está suspendido:
+   *   · el teléfono queda 100% libre: las apps abiertas del escritorio
+   *     vuelven al teléfono, split-screen/multitarea normales, cero
+   *     consumo USB (fix del «no puedo abrir apps en mi teléfono con
+   *     DexPort de fondo» — el display virtual ya no existe)
+   *   · la conexión USB sigue VIVA → reanudar tarda pocos segundos
+   */
+  suspendDesktop: async (reason = "manual") => {
+    const s = get();
+    if (s.phase !== "desktop" || s.suspended || s.reconnecting) return;
+    stopTelemetryLoop();
+    stopAppMonitorLoop();
+    stopLauncherWatchdog();
+    // marcar ANTES de parar el motor: el onExited del engine no debe
+    // disparar una reconexión automática de la parada voluntaria
+    set({
+      suspended: true,
+      controlOnline: false,
+      panels: {
+        ...s.panels,
+        drawerOpen: false,
+        mediaOpen: false,
+        deviceOpen: false,
+        settingsOpen: false,
+        shortcutsOpen: false,
+        taskViewOpen: false,
+        notificationsOpen: false,
+      },
+    });
+    try {
+      await displayEngine.stop();
+    } catch {
+      /* noop */
+    }
+    get().toast(
+      reason === "auto"
+        ? "Escritorio suspendido (pestaña en segundo plano) — el teléfono queda libre"
+        : "Escritorio suspendido — el teléfono queda libre",
+      "info",
+    );
+  },
+
+  /** v11: reconstruye el display virtual tras una suspensión. */
+  resumeDesktop: async () => {
+    const s = get();
+    if (!s.suspended || s.reconnecting) return;
+    set({ suspended: false });
+    // la fase rápida de reconnectDesktop reutiliza la conexión ADB viva
+    // (push del server + arranque del motor + onDisplayId → launcher)
+    await get().reconnectDesktop();
+    const st = useStore.getState();
+    if (!st.reconnecting && !st.suspended) {
+      startTelemetryLoop();
+      startAppMonitorLoop();
+      startLauncherWatchdog();
+      void st.checkAgent();
+      void st.refreshRunningApps();
+    }
+  },
+
+  /** v11: activa/desactiva el DexPort Agent (persistente). */
+  setAgentDisabled: (v) => {
+    saveAgentDisabled(v);
+    if (v) {
+      set({
+        agentStatus: "disabled",
+        agentPing: null,
+        agentTasks: [],
+        notifications: [],
+        notifListenerEnabled: false,
+      });
+      get().toast(
+        "DexPort Agent desactivado — modo solo ADB (sin íconos reales ni espejo de notificaciones)",
+        "info",
+      );
+    } else {
+      set({ agentStatus: "checking" });
+      get().toast("DexPort Agent reactivado — comprobando…", "info");
+      void get().checkAgent();
+    }
+  },
+
+  /** v11: desinstala el agente del teléfono por ADB. */
+  uninstallAgent: async () => {
+    if (!webAdb.adb) {
+      get().toast("Conecta el dispositivo primero", "error");
+      return;
+    }
+    const out = await webAdb.shellSafe(`pm uninstall ${AGENT_PKG} 2>&1`, 10_000);
+    if (/Success/i.test(out)) {
+      saveAgentDisabled(false);
+      set({
+        agentStatus: "missing",
+        agentPing: null,
+        agentTasks: [],
+        notifications: [],
+        notifListenerEnabled: false,
+        agentDisabled: false,
+      });
+      get().toast("DexPort Agent desinstalado del teléfono", "success");
+    } else {
+      get().toast("No se pudo desinstalar el agente", "error");
+    }
   },
 
   // ═════════════════════════════════════════════════════════
@@ -1593,19 +1765,26 @@ export const useStore = create<DexPortState>((set, get) => ({
   },
 
   /**
-   * v9: baja los íconos PNG reales que falten — lotes de 12, aplicando
+   * v9→v11: baja los íconos PNG reales que falten — lotes de 12, aplicando
    * cada lote al estado (los íconos van apareciendo progresivamente en
-   * el drawer/taskbar/TaskView). Terminado el lote útil (respuesta
-   * vacía) o la desconexión, para.
+   * el drawer/taskbar/TaskView).
+   *
+   * v11 (fix de los íconos a medias): paciencia REAL — hasta ~3 min de
+   * rondas pending (la primera enumeración del agente tarda decenas de
+   * segundos y antes nos rendíamos a los 15s). Además el appMonitor
+   * re-kickea este sync cada ~32s mientras falten íconos → se
+   * autorrepara solo, sin sondeo agresivo.
    */
   syncAgentIcons: async () => {
     if (iconSyncBusy) return;
     iconSyncBusy = true;
     try {
       let pendingRounds = 0;
+      let idleRounds = 0;
       for (;;) {
         const s = get();
         if (s.agentStatus !== "connected") return;
+        if (document.hidden) return; // re-kick al volver a la pestaña (appMonitor)
         const missing = [...s.userApps, ...s.systemApps]
           .filter((a) => !a.icon)
           .map((a) => a.packageName)
@@ -1632,16 +1811,22 @@ export const useStore = create<DexPortState>((set, get) => ({
           set({ userApps: apply(st.userApps), systemApps: apply(st.systemApps) });
           scheduleIconCacheSave();
           pendingRounds = 0;
+          idleRounds = 0;
           // respiro entre lotes: el agente genera en fondo y por USB
           // nunca debe haber ráfagas (v3 — gentil con el teléfono)
           await new Promise((r) => setTimeout(r, 350));
-        } else if (pending.length > 0 && pendingRounds < 10) {
-          // v3: el agente está generando esos íconos en su hilo de fondo
-          // (serializado, baja prioridad) → esperar y volver a pedir
+        } else if (pending.length > 0 && pendingRounds < 90) {
+          // v11: el agente está generando esos íconos en su hilo de fondo
+          // (serializado, baja prioridad) → esperar con paciencia real
           pendingRounds++;
-          await new Promise((r) => setTimeout(r, 1_500));
+          await new Promise((r) => setTimeout(r, 2_000));
+        } else if (idleRounds < 3) {
+          // sin pendientes declarados pero sin datos → un par de intentos
+          // más (p.ej. el lote siguiente aún no encolado) y salir
+          idleRounds++;
+          await new Promise((r) => setTimeout(r, 3_000));
         } else {
-          return; // nada útil → no insistir
+          return; // nada útil → no insistir (el re-kick del loop sigue vivo)
         }
       }
     } finally {
@@ -1657,6 +1842,7 @@ export const useStore = create<DexPortState>((set, get) => ({
   refreshNotifications: async () => {
     const s = get();
     if (s.agentStatus !== "connected" || notifRefreshBusy) return;
+    if (document.hidden) return; // v11: pestaña oculta → cero tráfico USB
     notifRefreshBusy = true;
     try {
       const res = await agentBridge.getNotifications();
@@ -1680,6 +1866,16 @@ export const useStore = create<DexPortState>((set, get) => ({
             `${n.label || n.packageName}: ${n.title || n.text}`.slice(0, 110),
             "info",
           );
+        }
+      }
+      // v11: memoria acotada en sesiones largas — podar las vistas más
+      // viejas (los Sets de JS conservan el orden de inserción)
+      if (seenNotifKeys.size > 400) {
+        const it = seenNotifKeys.values();
+        for (let i = 0; i < 120; i++) {
+          const v = it.next();
+          if (v.done) break;
+          seenNotifKeys.delete(v.value);
         }
       }
     } finally {
@@ -1961,7 +2157,7 @@ export const useStore = create<DexPortState>((set, get) => ({
   // RECONEXIÓN — port del ReconnectionManager (2 fases)
   // ═════════════════════════════════════════════════════════
   reconnectDesktop: async () => {
-    if (get().reconnecting) return;
+    if (get().reconnecting || get().suspended) return;
     set({ reconnecting: true, reconnectMessage: "Intentando reconectar con el dispositivo…" });
 
     // Fase 1: reconexión rápida (sin redesplegar)
@@ -2021,6 +2217,11 @@ export const useStore = create<DexPortState>((set, get) => ({
     stopTelemetryLoop();
     stopAppMonitorLoop();
     stopLauncherWatchdog();
+    if (ecoSuspendTimer) {
+      clearTimeout(ecoSuspendTimer);
+      ecoSuspendTimer = null;
+    }
+    ecoAutoSuspended = false;
     await restorePowerSetting();
     await displayEngine.stop();
     await webAdb.disconnect();
@@ -2050,6 +2251,8 @@ export const useStore = create<DexPortState>((set, get) => ({
       notifications: [],
       notifListenerEnabled: false,
       defaultLauncherComponent: null,
+      // v11
+      suspended: false,
       displayId: null,
       controlOnline: false,
       mirrorMode: false,
@@ -2140,9 +2343,11 @@ function startLauncherWatchdog(): void {
   watchdogEmptyStreak = 0;
   watchdogSawContent = false;
   watchdogTimer = setInterval(async () => {
+    if (document.hidden) return; // v11: pestaña oculta → no intervenir
     const s = useStore.getState();
     if (
       watchdogBusy ||
+      s.suspended ||
       s.phase !== "desktop" ||
       s.reconnecting ||
       s.mirrorMode ||
@@ -2213,8 +2418,9 @@ function waitFor(
 function startTelemetryLoop(): void {
   stopTelemetryLoop();
   telemetryTimer = setInterval(() => {
+    if (document.hidden) return; // v11: pestaña oculta → cero tráfico
     const s = useStore.getState();
-    if (s.phase === "desktop" && !s.reconnecting) {
+    if (s.phase === "desktop" && !s.reconnecting && !s.suspended) {
       void s.refreshTelemetry();
       // v9: espejo de notificaciones cada 5s (con el agente conectado)
       if (s.agentStatus === "connected") {
@@ -2236,13 +2442,25 @@ function startAppMonitorLoop(): void {
   stopAppMonitorLoop();
   let tick = 0;
   appMonitorTimer = setInterval(() => {
+    if (document.hidden) return; // v11: pestaña oculta → cero tráfico
     const s = useStore.getState();
-    if (s.phase === "desktop" && !s.reconnecting && s.displayId != null) {
+    if (s.phase === "desktop" && !s.reconnecting && !s.suspended && s.displayId != null) {
       void s.refreshRunningApps();
       // v8: reintentar el agente cada ~24s si no está conectado
       tick++;
-      if (s.agentStatus !== "connected" && tick % 6 === 0) {
+      if (s.agentStatus !== "connected" && s.agentStatus !== "disabled" && tick % 6 === 0) {
         void s.checkAgent();
+      }
+      // v11: AUTORREPARACIÓN de la fuente real del agente — si la lista
+      // quedó a medias o faltan íconos (p.ej. primera enumeración lenta),
+      // re-kickear el sync cada ~20-32s hasta que esté completa
+      if (s.agentStatus === "connected") {
+        if (!s.agentAppsSynced && tick % 5 === 0) {
+          void s.syncAgentApps();
+        } else if (tick % 8 === 0) {
+          const anyMissingIcon = [...s.userApps, ...s.systemApps].some((a) => !a.icon);
+          if (anyMissingIcon) void s.syncAgentIcons();
+        }
       }
     }
   }, 4000);
@@ -2258,7 +2476,60 @@ function stopAppMonitorLoop(): void {
 // Vigilancia global de desconexión (ReconnectionManager port)
 webAdb.onDisconnected(() => {
   const s = useStore.getState();
-  if (s.phase === "desktop" && !s.reconnecting) {
+  if (s.phase === "desktop" && !s.reconnecting && !s.suspended) {
     void s.reconnectDesktop();
   }
 });
+
+// ═════════════════════════════════════════════════════════
+// v11: MODO ECOLÓGICO — pestaña en segundo plano
+// ═════════════════════════════════════════════════════════
+// Los loops ya no hacen NADA con la pestaña oculta (cero tráfico
+// USB, cero timers apilados). Si sigue oculta ~3 minutos, el
+// escritorio se suspende por completo: el display virtual se
+// DESTRUYE y el teléfono queda 100% libre (apps, multitarea,
+// notificaciones) — fix del «no puedo abrir apps en mi teléfono
+// con DexPort de fondo». Al volver a la pestaña, se reanuda solo.
+let ecoSuspendTimer: ReturnType<typeof setTimeout> | null = null;
+let ecoAutoSuspended = false;
+
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      const s = useStore.getState();
+      if (
+        s.phase === "desktop" &&
+        !s.reconnecting &&
+        !s.suspended &&
+        s.settings.ecoMode
+      ) {
+        if (ecoSuspendTimer) clearTimeout(ecoSuspendTimer);
+        ecoSuspendTimer = setTimeout(() => {
+          const st = useStore.getState();
+          if (
+            document.hidden &&
+            st.phase === "desktop" &&
+            !st.suspended &&
+            !st.reconnecting &&
+            st.settings.ecoMode
+          ) {
+            ecoAutoSuspended = true;
+            void st.suspendDesktop("auto");
+          }
+        }, 180_000); // 3 min en segundo plano
+      }
+    } else {
+      if (ecoSuspendTimer) {
+        clearTimeout(ecoSuspendTimer);
+        ecoSuspendTimer = null;
+      }
+      // reanudar solo las suspensiones AUTOMÁTICAS (las manuales las
+      // decide el usuario con el botón «Reanudar»)
+      if (ecoAutoSuspended) {
+        ecoAutoSuspended = false;
+        const st = useStore.getState();
+        if (st.suspended) void st.resumeDesktop();
+      }
+    }
+  });
+}

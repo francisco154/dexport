@@ -75,6 +75,13 @@ export interface DisplaySettings {
   hideIme: boolean;
   /** mantener el dispositivo despierto mientras DexPort está conectado */
   keepScreenOn: boolean;
+  // ── v11 ──
+  /**
+   * Modo ecológico: si la pestaña pasa a segundo plano ~3 min, el
+   * escritorio se suspende solo (display virtual destruido) → el
+   * teléfono queda 100% libre y sin tráfico USB. Al volver, se reanuda.
+   */
+  ecoMode: boolean;
 }
 
 export const DEFAULT_DISPLAY_SETTINGS: DisplaySettings = {
@@ -91,6 +98,7 @@ export const DEFAULT_DISPLAY_SETTINGS: DisplaySettings = {
   androidBars: false,
   hideIme: true,
   keepScreenOn: true,
+  ecoMode: true,
 };
 
 export interface DisplayEngineEvents {

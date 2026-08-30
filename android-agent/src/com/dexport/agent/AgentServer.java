@@ -194,7 +194,7 @@ public class AgentServer extends Thread {
             switch (cmd == null ? "" : cmd) {
                 case "ping": {
                     res.put("service", "DexPort Agent");
-                    res.put("version", 3);
+                    res.put("version", 4);
                     res.put("sdk", Build.VERSION.SDK_INT);
                     res.put("android", Build.VERSION.RELEASE);
                     res.put("device", Build.MANUFACTURER + " " + Build.MODEL);

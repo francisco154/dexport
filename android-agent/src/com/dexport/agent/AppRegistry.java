@@ -308,11 +308,19 @@ public final class AppRegistry {
      * NUNCA renderiza aquí. Los paquetes sin ícono van a la cola del
      * worker (serializado, baja prioridad) y se devuelven en "pending"
      * para que la web los vuelva a pedir en ~1.5s.
+     *
+     * v4 (fix de los íconos que se quedaban a medias): cada paquete
+     * encolado AGENDA TAMBIÉN un drenaje del worker. En la v3 el
+     * drenaje solo ocurría dentro de prewarm()/appsStateJson() — si el
+     * worker estaba tranquilo cuando la web pedía un lote nuevo, los
+     * íconos quedaban en la cola PARA SIEMPRE (solo se renderizaban los
+     * primeros ~6-12 del arranque). Ahora cada lote se drena solo.
      */
     public JSONObject iconsStateJson(List<String> pkgs) {
         JSONObject out = new JSONObject();
         JSONArray ready = new JSONArray();
         JSONArray pending = new JSONArray();
+        boolean scheduled = false;
         if (pkgs != null) {
             long now = System.currentTimeMillis();
             for (String pkg : pkgs) {
@@ -331,11 +339,21 @@ public final class AppRegistry {
                     if (a != null && a.iconFails >= MAX_ICON_FAILS) {
                         continue; // sin ícono posible → no insistir
                     }
-                    enqueueIcon(pkg);
+                    if (enqueueIcon(pkg)) {
+                        scheduled = true; // hay trabajo nuevo → drenar
+                    }
                     pending.put(pkg);
                 } catch (Exception ignored) {
                 }
             }
+        }
+        if (scheduled) {
+            submit(new Runnable() {
+                @Override
+                public void run() {
+                    drainIconQueue();
+                }
+            });
         }
         try {
             out.put("icons", ready);
@@ -345,10 +363,13 @@ public final class AppRegistry {
         return out;
     }
 
-    private void enqueueIcon(final String pkg) {
+    /** Encola un ícono; true si era NUEVO (había que renderizarlo). */
+    private boolean enqueueIcon(final String pkg) {
         if (iconQueued.add(pkg)) {
             iconQueue.offer(pkg);
+            return true;
         }
+        return false;
     }
 
     /** SOLO el hilo de fondo: drena la cola de íconos con respiros. */

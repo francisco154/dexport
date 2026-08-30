@@ -178,6 +178,9 @@ function AgentCard({ prominent = false }: { prominent?: boolean }) {
     );
   }
 
+  // v11: agente desactivado por el usuario → no promocionarlo
+  if (agentStatus === "disabled") return null;
+
   const busy = agentInstall.phase === "downloading" ||
     agentInstall.phase === "pushing" || agentInstall.phase === "installing" ||
     agentInstall.phase === "enabling" || agentInstall.phase === "verifying";

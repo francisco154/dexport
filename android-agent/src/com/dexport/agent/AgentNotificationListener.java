@@ -176,13 +176,12 @@ public class AgentNotificationListener extends NotificationListenerService {
                     o.put("posted_at", sbn.getPostTime());
                     o.put("ongoing", sbn.isOngoing());
                     o.put("clearable", sbn.isClearable());
-                    // ícono SOLO del cache (nunca renderizar aquí)
-                    if (reg != null) {
-                        String icon = reg.iconOf(pkg);
-                        if (icon != null) {
-                            o.put("icon", icon);
-                        }
-                    }
+                    // v4: SIN ícono en el poll — la web lo resuelve por
+                    // package_name con los íconos de apps que ya sincronizó.
+                    // (La v3 mandaba el PNG base64 de la app emisora en CADA
+                    // consulta cada 5s: decenas de KB repetidos que
+                    // saturaban el USB y el hilo del navegador. El paquete
+                    // basta: el ícono es el mismo que el del app drawer.)
                     arr.put(o);
                 } catch (Exception ignored) {
                     // una notificación rara no rompe el resto
