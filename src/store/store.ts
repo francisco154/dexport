@@ -425,8 +425,12 @@ let telemetryTimer: ReturnType<typeof setInterval> | null = null;
 let appMonitorTimer: ReturnType<typeof setInterval> | null = null;
 /** v9: guard de syncAgentIcons (una sola tanda de lotes a la vez) */
 let iconSyncBusy = false;
-/** v9: auto-actualización v1→v2 del agente — un intento por sesión */
+/** v10: auto-actualización del agente a v3 — un intento por sesión */
 let agentUpgradeAttempted = false;
+/** v10: limpieza de perfiles de trabajo (Island) — una vez por sesión */
+let agentProfilesCleaned = false;
+/** v10: guard de refreshNotifications (sin solapamientos) */
+let notifRefreshBusy = false;
 /** v9: notificaciones ya vistas (para toasts solo de las NUEVAS) */
 const seenNotifKeys = new Set<string>();
 let notifFirstLoad = true;
@@ -1420,17 +1424,47 @@ export const useStore = create<DexPortState>((set, get) => ({
     const pong = await agentBridge.ping();
     if (pong) {
       set({ agentStatus: "connected", agentPing: pong });
-      // v9: el agente v1 (solo detección) se ACTUALIZA solo a v2
-      // (íconos reales + notificaciones + HOME determinista)
-      if (pong.version < 2) {
+      // v10: el agente v1/v2 se ACTUALIZA solo a v3 (reconstrucción sin
+      // bloqueos: sin getRoot, sin prefetch de nodos, worker único de fondo)
+      if (pong.version < 3) {
         if (!agentUpgradeAttempted) {
           agentUpgradeAttempted = true;
-          get().toast("Actualizando DexPort Agent a v2 — íconos y notificaciones…", "info");
+          get().toast(
+            "Actualizando DexPort Agent a v3 — reconstruido para no frenar el teléfono…",
+            "info",
+          );
           void get().installAgent();
           // el servicio de accesibilidad renace tras el upgrade → re-check
           setTimeout(() => void useStore.getState().checkAgent(), 6_000);
         }
         return;
+      }
+      // v10: ¿el agente quedó corriendo en un perfil de trabajo (Island)?
+      // → aviso + limpieza de duplicados (una vez por sesión)
+      if (pong.userId > 0) {
+        get().toast(
+          `El agente corre en el perfil ${pong.userId} (¿Island?) — reinstalando en el perfil principal…`,
+          "error",
+        );
+        if (!agentUpgradeAttempted) {
+          agentUpgradeAttempted = true;
+          void get().installAgent();
+          setTimeout(() => void useStore.getState().checkAgent(), 8_000);
+        }
+        return;
+      }
+      if (!agentProfilesCleaned) {
+        agentProfilesCleaned = true;
+        void agentBridge.cleanOtherProfiles().then((cleaned) => {
+          if (cleaned.length > 0) {
+            useStore
+              .getState()
+              .toast(
+                `Agente duplicado eliminado de ${cleaned.length} perfil(es) de trabajo ✓`,
+                "success",
+              );
+          }
+        });
       }
       // v9: al conectar → apps/íconos reales + launcher predefinido + notifs
       void useStore.getState().syncAgentApps();
@@ -1562,6 +1596,7 @@ export const useStore = create<DexPortState>((set, get) => ({
     if (iconSyncBusy) return;
     iconSyncBusy = true;
     try {
+      let pendingRounds = 0;
       for (;;) {
         const s = get();
         if (s.agentStatus !== "connected") return;
@@ -1570,24 +1605,38 @@ export const useStore = create<DexPortState>((set, get) => ({
           .map((a) => a.packageName)
           .slice(0, 12);
         if (missing.length === 0) return;
-        const map = await agentBridge.getIcons(missing).catch(() => new Map<string, string>());
-        if (map.size === 0) return; // nada útil → no insistir
-        const apply = (list: AppEntry[]) =>
-          list.map((e) => {
-            const icon = map.get(e.packageName);
-            if (!icon) return e;
-            const cached = iconCache.get(e.packageName);
-            iconCache.set(e.packageName, {
-              label: e.label,
-              icon,
-              ...(e.component ? { component: e.component } : {}),
-              ...(cached?.component && !e.component ? { component: cached.component } : {}),
+        const { icons: map, pending } = await agentBridge
+          .getIcons(missing)
+          .catch(() => ({ icons: new Map<string, string>(), pending: [] as string[] }));
+        if (map.size > 0) {
+          const apply = (list: AppEntry[]) =>
+            list.map((e) => {
+              const icon = map.get(e.packageName);
+              if (!icon) return e;
+              const cached = iconCache.get(e.packageName);
+              iconCache.set(e.packageName, {
+                label: e.label,
+                icon,
+                ...(e.component ? { component: e.component } : {}),
+                ...(cached?.component && !e.component ? { component: cached.component } : {}),
+              });
+              return { ...e, icon };
             });
-            return { ...e, icon };
-          });
-        const st = get();
-        set({ userApps: apply(st.userApps), systemApps: apply(st.systemApps) });
-        scheduleIconCacheSave();
+          const st = get();
+          set({ userApps: apply(st.userApps), systemApps: apply(st.systemApps) });
+          scheduleIconCacheSave();
+          pendingRounds = 0;
+          // respiro entre lotes: el agente genera en fondo y por USB
+          // nunca debe haber ráfagas (v3 — gentil con el teléfono)
+          await new Promise((r) => setTimeout(r, 350));
+        } else if (pending.length > 0 && pendingRounds < 10) {
+          // v3: el agente está generando esos íconos en su hilo de fondo
+          // (serializado, baja prioridad) → esperar y volver a pedir
+          pendingRounds++;
+          await new Promise((r) => setTimeout(r, 1_500));
+        } else {
+          return; // nada útil → no insistir
+        }
       }
     } finally {
       iconSyncBusy = false;
@@ -1601,29 +1650,34 @@ export const useStore = create<DexPortState>((set, get) => ({
    */
   refreshNotifications: async () => {
     const s = get();
-    if (s.agentStatus !== "connected") return;
-    const res = await agentBridge.getNotifications();
-    if (!res) return;
-    set({ notifications: res.notifications, notifListenerEnabled: res.enabled });
-    if (!res.enabled) return;
+    if (s.agentStatus !== "connected" || notifRefreshBusy) return;
+    notifRefreshBusy = true;
+    try {
+      const res = await agentBridge.getNotifications();
+      if (!res) return;
+      set({ notifications: res.notifications, notifListenerEnabled: res.enabled });
+      if (!res.enabled) return;
 
-    if (notifFirstLoad) {
-      for (const n of res.notifications) seenNotifKeys.add(n.key);
-      notifFirstLoad = false;
-      return;
-    }
-    // toasts de notificaciones nuevas (máx. 3 por refresco)
-    let shown = 0;
-    for (const n of res.notifications) {
-      if (seenNotifKeys.has(n.key)) continue;
-      seenNotifKeys.add(n.key);
-      if (shown < 3 && !n.ongoing && (n.title || n.text)) {
-        shown++;
-        get().toast(
-          `${n.label || n.packageName}: ${n.title || n.text}`.slice(0, 110),
-          "info",
-        );
+      if (notifFirstLoad) {
+        for (const n of res.notifications) seenNotifKeys.add(n.key);
+        notifFirstLoad = false;
+        return;
       }
+      // toasts de notificaciones nuevas (máx. 3 por refresco)
+      let shown = 0;
+      for (const n of res.notifications) {
+        if (seenNotifKeys.has(n.key)) continue;
+        seenNotifKeys.add(n.key);
+        if (shown < 3 && !n.ongoing && (n.title || n.text)) {
+          shown++;
+          get().toast(
+            `${n.label || n.packageName}: ${n.title || n.text}`.slice(0, 110),
+            "info",
+          );
+        }
+      }
+    } finally {
+      notifRefreshBusy = false;
     }
   },
 

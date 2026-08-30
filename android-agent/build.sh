@@ -47,7 +47,7 @@ echo "── 3/7  aapt2 link (manifest + R.java)"
   --java build/gen \
   -R build/res.zip \
   --min-sdk-version 26 --target-sdk-version 34 \
-  --version-code 2 --version-name "1.1" \
+  --version-code 3 --version-name "1.2" \
   --auto-add-overlay
 
 echo "── 4/7  javac (Java 8 bytecode)"

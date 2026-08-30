@@ -402,7 +402,7 @@ function AgentSettingsSection() {
     <>
       <h3 className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#5a606c]">
         <Radar size={13} className="text-sky-300/70" />
-        DexPort Agent v2 · detección + íconos + notificaciones
+        DexPort Agent v3 · detección + íconos + notificaciones
       </h3>
       <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-sky-400/15 bg-sky-400/5 p-4">
         <div className="flex items-center justify-between gap-3">
@@ -428,7 +428,7 @@ function AgentSettingsSection() {
           ) : (
             <button className="btn-solid !py-2 !text-[12px]" onClick={() => void installAgent()}>
               <Download size={12} />
-              {agentStatus === "missing" ? "Instalar (50 KB)" : "Activar"}
+              {agentStatus === "missing" ? "Instalar (54 KB)" : "Activar"}
             </button>
           )}
         </div>
@@ -456,17 +456,32 @@ function AgentSettingsSection() {
             <span className="rounded-full bg-white/6 px-2.5 py-1 text-[#c3c9d4]">
               ✓ HOME al launcher predefinido
             </span>
+            <span
+              className={`rounded-full px-2.5 py-1 ${
+                agentPing && agentPing.userId === 0
+                  ? "bg-white/6 text-[#c3c9d4]"
+                  : "bg-[#f59e0b]/12 text-[#fbbf24]"
+              }`
+            }
+            >
+              {agentPing && agentPing.userId === 0
+                ? "✓ perfil principal"
+                : "⚠ corre en perfil de trabajo"}
+            </span>
           </div>
         )}
 
         <p className="text-[11.5px] leading-relaxed text-[#aab3bf]">
           El agente mapea lo que ADB no puede ver: apps y ventanas abiertas en
           ambas pantallas (título, actividad y foco por display), los íconos y
-          nombres reales de las apps, las notificaciones activas del teléfono
-          (centro de notificaciones del escritorio) y el launcher predefinido
-          para que HOME lleve siempre al mismo sitio. Se instala y recibe todos
-          sus permisos por ADB — sin tocar el teléfono. Todo queda en tu
-          dispositivo (USB).
+          nombres reales de TODAS las apps instaladas, las notificaciones activas
+          del teléfono (centro de notificaciones del escritorio) y el launcher
+          predefinido para que HOME lleve siempre al mismo sitio. v3
+          reconstruido para no frenar NUNCA el teléfono: servicio de
+          accesibilidad ultraligero, todo el trabajo pesado en un hilo de fondo
+          y solo en el perfil principal (sin duplicados en Island). Se instala
+          y recibe todos sus permisos por ADB — sin tocar el teléfono. Todo
+          queda en tu dispositivo (USB).
         </p>
         {agentStatus === "no-permission" && (
           <p className="rounded-xl bg-amber-400/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">

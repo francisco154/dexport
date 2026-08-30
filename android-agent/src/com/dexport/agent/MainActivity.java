@@ -89,14 +89,12 @@ public class MainActivity extends Activity {
         // ── instrucciones ──
         box.addView(sectionTitle("Cómo funciona"), sectionLp());
         box.addView(paragraph(
-                "1. DexPort (la web) instala este agente automáticamente por ADB cuando pulsas «Instalar Agent».\n\n"
-                        + "2. El permiso de accesibilidad también se concede por ADB — al activarse, el agente "
-                        + "abre su puente local en el puerto 8458.\n\n"
-                        + "3. DexPort consulta ese puente para ver las apps y ventanas abiertas (del teléfono y "
-                        + "del escritorio virtual), saber cuál está enfocada y enviar Atrás/Inicio/Recientes de forma fiable.\n\n"
-                        + "4. v2: además espeja las NOTIFICACIONES activas (con su permiso propio, también por ADB), "
-                        + "entrega los ÍCONOS y nombres reales de las apps y resuelve el launcher predefinido.\n\n"
-                        + "5. No sale ningún dato del dispositivo: la conexión pasa por el cable USB (ADB)."));
+                "1. DexPort (la web) instala este agente automáticamente por ADB cuando pulsas «Instalar Agent» — solo en el perfil principal del teléfono (nunca en perfiles de trabajo como Island).\n\n"
+                        + "2. El permiso de accesibilidad también se concede por ADB — al activarse, el agente abre su puente local en el puerto 8458.\n\n"
+                        + "3. DexPort consulta ese puente para ver las apps y ventanas abiertas (del teléfono y del escritorio virtual), saber cuál está enfocada y enviar Atrás/Inicio/Recientes de forma fiable.\n\n"
+                        + "4. Además espeja las NOTIFICACIONES activas (permiso propio por ADB), entrega los ÍCONOS y nombres reales de TODAS las apps instaladas y resuelve el launcher predefinido.\n\n"
+                        + "5. v3 — RECONSTRUIDO para no intervenir NUNCA en el rendimiento: el servicio de accesibilidad es ultraligero (sin inspección de contenido de ventanas) y todo el trabajo pesado pasa por un único hilo de fondo de baja prioridad.\n\n"
+                        + "6. No sale ningún dato del dispositivo: la conexión pasa por el cable USB (ADB)."));
 
         box.addView(sectionTitle("Privacidad"), sectionLp());
         box.addView(paragraph(
@@ -106,9 +104,9 @@ public class MainActivity extends Activity {
 
         box.addView(sectionTitle("Puente"), sectionLp());
         box.addView(paragraph(
-                "Comandos v1: ping · tasks.get_all · windows.get_all · events.recent · foreground.get · "
-                        + "action.back | home | recents | notifications | quick_settings | lock_screen | all_apps\n"
-                        + "Comandos v2: apps.get · icons.get · launcher.get · notifications.get · "
+                "Comandos: ping · tasks.get_all · windows.get_all · events.recent · foreground.get · "
+                        + "action.back | home | recents | notifications | quick_settings | lock_screen | all_apps · "
+                        + "apps.get · icons.get · launcher.get · notifications.get · "
                         + "notification.dismiss · notifications.clear_all\n"
                         + "Protocolo: una línea JSON por request → una línea JSON de respuesta (puerto 127.0.0.1:"
                         + AgentServer.PORT + ")."));
@@ -130,11 +128,13 @@ public class MainActivity extends Activity {
         boolean notif = AgentNotificationListener.isConnected();
         String sdk = Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")";
         boolean multi = Build.VERSION.SDK_INT >= 33;
+        int userId = android.os.Process.myUid() / 100_000;
         if (enabled) {
             statusLine.setTextColor(0xFF4ADE80);
-            statusLine.setText("● ACTIVO — puente 127.0.0.1:" + AgentServer.PORT
+            statusLine.setText("● ACTIVO v3 — puente 127.0.0.1:" + AgentServer.PORT
                     + "\nAndroid " + sdk + (multi ? " · ventanas por display ✓" : "")
-                    + "\nNotificaciones: " + (notif ? "espejadas ✓" : "no concedidas"));
+                    + "\nNotificaciones: " + (notif ? "espejadas ✓" : "no concedidas")
+                    + "\nPerfil: " + (userId == 0 ? "principal ✓" : ("TRABAJO (" + userId + ") — reinstalá desde DexPort")));
         } else {
             statusLine.setTextColor(0xFFF59E0B);
             statusLine.setText("○ SIN PERMISO — activa «DexPort Agent»\nen Accesibilidad"

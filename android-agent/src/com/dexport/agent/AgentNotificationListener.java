@@ -1,34 +1,46 @@
 package com.dexport.agent;
 
 import android.app.Notification;
-import android.content.Context;
-import android.os.Bundle;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
- * DexPort Agent v2 — espejo de NOTIFICACIONES.
+ * DexPort Agent v3 — espejo de NOTIFICACIONES (RECONSTRUIDO).
  * ════════════════════════════════════════════════════════════
- * La nueva utilidad del agente: todo lo que ADB no puede ver de las
- * notificaciones activas del teléfono.
+ * La v2 llamaba getActiveNotifications() (binder al
+ * NotificationManager) y getApplicationLabel/getApplicationInfo por
+ * CADA notificación en CADA consulta de la web (cada 5s) — todo eso
+ * en los hilos del servidor.
  *
- *   · notifications.get    → lista viva: app, ícono, título, texto,
- *                            hora, ongoing, descartable → la web las
- *                            muestra en un CENTRO DE NOTIFICACIONES
- *                            estilo Windows dentro del escritorio
- *   · notification.dismiss → descartar una notificación DESDE la web
- *   · notifications.clear_all → limpiar todas (las descartables)
+ * v3 mantiene un snapshot VIVO en un ConcurrentHashMap que actualizan
+ * los propios callbacks del sistema (onNotificationPosted/Removed) y
+ * una única llamada inicial al conectar. La consulta de la web es
+ * lectura de memoria + JSON — cero binder, cero PackageManager.
  *
- * El permiso NotificationListenerService se concede por ADB
- * (`cmd notification allow_listener com.dexport.agent/.AgentNotificationListener`)
- * — el mismo flujo sin tocar el teléfono que usa la accesibilidad.
+ *   · notifications.get    → lista viva: app, ícono (cache), título,
+ *                            texto, hora, ongoing, descartable
+ *   · notification.dismiss → descartar desde la web
+ *   · notifications.clear_all → limpiar las descartables
  */
 public class AgentNotificationListener extends NotificationListenerService {
 
+    /** Máximo de notificaciones en el snapshot (las más recientes). */
+    private static final int MAX = 50;
+
     private static volatile AgentNotificationListener sInstance;
+
+    /** Snapshot vivo: key → notificación. */
+    private final Map<String, StatusBarNotification> active =
+            new ConcurrentHashMap<>(32);
 
     public static AgentNotificationListener getInstance() {
         return sInstance;
@@ -42,24 +54,79 @@ public class AgentNotificationListener extends NotificationListenerService {
     public void onListenerConnected() {
         super.onListenerConnected();
         sInstance = this;
+        // única enumeración completa: al conectar
+        try {
+            StatusBarNotification[] sbns = getActiveNotifications();
+            if (sbns != null) {
+                for (StatusBarNotification sbn : sbns) {
+                    if (sbn != null) {
+                        active.put(sbn.getKey(), sbn);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
     public void onListenerDisconnected() {
         sInstance = null;
+        active.clear();
         super.onListenerDisconnected();
     }
 
-    // ── snapshots para el AgentServer ─────────────────────────
+    @Override
+    public void onNotificationPosted(StatusBarNotification sbn) {
+        if (sbn == null) {
+            return;
+        }
+        active.put(sbn.getKey(), sbn);
+        trim();
+        // v3: si es una app sin entrada en el registro, pedir label+ícono
+        // EN EL FONDO (para el centro de notificaciones de la web)
+        try {
+            AppRegistry.get(this).touch(sbn.getPackageName());
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void onNotificationRemoved(StatusBarNotification sbn) {
+        if (sbn == null) {
+            return;
+        }
+        active.remove(sbn.getKey());
+    }
+
+    private void trim() {
+        while (active.size() > MAX + 16) {
+            // podar la más vieja
+            String oldestKey = null;
+            long oldest = Long.MAX_VALUE;
+            for (Map.Entry<String, StatusBarNotification> e : active.entrySet()) {
+                StatusBarNotification v = e.getValue();
+                long t = v == null ? 0 : v.getPostTime();
+                if (t < oldest) {
+                    oldest = t;
+                    oldestKey = e.getKey();
+                }
+            }
+            if (oldestKey == null) {
+                return;
+            }
+            active.remove(oldestKey);
+        }
+    }
+
+    // ── snapshot para el AgentServer (instantáneo) ────────────
 
     /**
      * Lista de notificaciones activas (la más reciente primero).
-     * Sin permiso → lista vacía con enabled=false (la web puede
-     * ofrecer activarlo).
+     * Sin permiso → lista vacía con enabled=false (la web ofrece
+     * activarlo). CERO binder: memoria + JSON.
      */
-    public static JSONObject snapshotJson(Context ctx) {
+    public static JSONObject snapshotJson(AgentNotificationListener l) {
         JSONObject out = new JSONObject();
-        AgentNotificationListener l = sInstance;
         if (l == null) {
             try {
                 out.put("enabled", false);
@@ -69,50 +136,52 @@ public class AgentNotificationListener extends NotificationListenerService {
             return out;
         }
         try {
-            StatusBarNotification[] sbns = l.getActiveNotifications();
+            List<StatusBarNotification> sbns = new ArrayList<>(l.active.values());
+            sbns.sort(new Comparator<StatusBarNotification>() {
+                @Override
+                public int compare(StatusBarNotification a, StatusBarNotification b) {
+                    long ta = a == null ? 0 : a.getPostTime();
+                    long tb = b == null ? 0 : b.getPostTime();
+                    return Long.compare(tb, ta); // nuevas primero
+                }
+            });
+            AppRegistry reg = l.registryOrNull();
             JSONArray arr = new JSONArray();
-            AppRegistry reg = AppRegistry.get(ctx);
-            // getActiveNotifications no garantiza orden → ordenar por postTime
-            long[] times = new long[sbns.length];
-            Integer[] idx = new Integer[sbns.length];
-            for (int i = 0; i < sbns.length; i++) {
-                times[i] = sbns[i] == null ? 0 : sbns[i].getPostTime();
-                idx[i] = i;
-            }
-            java.util.Arrays.sort(idx, (a, b) -> Long.compare(times[b], times[a]));
-            for (int i : idx) {
-                StatusBarNotification sbn = sbns[i];
-                if (sbn == null || sbn.getNotification() == null) {
+            int n = 0;
+            for (StatusBarNotification sbn : sbns) {
+                if (sbn == null || sbn.getNotification() == null || n >= MAX) {
                     continue;
                 }
+                n++;
                 try {
-                    Notification n = sbn.getNotification();
-                    Bundle e = n.extras;
-                    String title = str(e.getCharSequence(Notification.EXTRA_TITLE));
-                    String text = str(e.getCharSequence(Notification.EXTRA_TEXT));
-                    if (text == null || text.isEmpty()) {
-                        text = str(e.getCharSequence(Notification.EXTRA_BIG_TEXT));
+                    Notification notif = sbn.getNotification();
+                    String title = str(notif.extras.getCharSequence(Notification.EXTRA_TITLE));
+                    String text = str(notif.extras.getCharSequence(Notification.EXTRA_TEXT));
+                    if (text == null) {
+                        text = str(notif.extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
                     }
                     String pkg = sbn.getPackageName();
                     JSONObject o = new JSONObject();
                     o.put("key", sbn.getKey());
                     o.put("package_name", pkg);
-                    o.put("label", reg.labelOf(pkg));
+                    String label = reg == null ? "" : reg.labelOf(pkg);
+                    o.put("label", label.isEmpty() ? pkg : label);
                     if (title != null) {
                         o.put("title", title);
                     }
                     if (text != null) {
                         o.put("text", text);
                     }
-                    o.put("when", n.when > 0 ? n.when : sbn.getPostTime());
+                    o.put("when", notif.when > 0 ? notif.when : sbn.getPostTime());
                     o.put("posted_at", sbn.getPostTime());
                     o.put("ongoing", sbn.isOngoing());
                     o.put("clearable", sbn.isClearable());
-                    // ícono de la app (del cache del registro; null si aún
-                    // no se generó — la web usa el que ya tenga en su cache)
-                    AppRegistry.App app = reg.appFor(pkg);
-                    if (app != null && app.icon != null) {
-                        o.put("icon", app.icon);
+                    // ícono SOLO del cache (nunca renderizar aquí)
+                    if (reg != null) {
+                        String icon = reg.iconOf(pkg);
+                        if (icon != null) {
+                            o.put("icon", icon);
+                        }
                     }
                     arr.put(o);
                 } catch (Exception ignored) {
@@ -132,9 +201,16 @@ public class AgentNotificationListener extends NotificationListenerService {
         return out;
     }
 
+    private AppRegistry registryOrNull() {
+        try {
+            return AppRegistry.get(this);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** Descarta una notificación por key. */
-    public static boolean dismiss(String key) {
-        AgentNotificationListener l = sInstance;
+    public static boolean dismiss(AgentNotificationListener l, String key) {
         if (l == null || key == null || key.isEmpty()) {
             return false;
         }
@@ -147,8 +223,7 @@ public class AgentNotificationListener extends NotificationListenerService {
     }
 
     /** Descarta todas las descartables. */
-    public static boolean clearAll() {
-        AgentNotificationListener l = sInstance;
+    public static boolean clearAll(AgentNotificationListener l) {
         if (l == null) {
             return false;
         }

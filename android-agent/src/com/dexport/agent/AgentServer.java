@@ -2,6 +2,7 @@ package com.dexport.agent;
 
 import android.accessibilityservice.AccessibilityService;
 import android.os.Build;
+import android.os.Process;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -20,47 +21,50 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * DexPort Agent v2 — servidor TCP (localhost:8458).
+ * DexPort Agent v3 — servidor TCP (localhost:8458).
  * ════════════════════════════════════════════════════════════
- * Mismo protocolo de líneas JSON que el companion original (8457):
+ * Protocolo de líneas JSON (una conexión por request):
  *   request :  {"type": "<cmd>", "id": "<n>"}\n
  *   response:  {"status": "success", ..., "id": "<n>"}\n
- * Una conexión por request (handleClient serializado por conexión).
  * La web llega por adb.createSocket("tcp:8458").
  *
- * Comandos v1 (detección — funcionando):
- *   ping                → version / sdk / device
- *   tasks.get_all       → apps abiertas (ventanas TYPE_APPLICATION de todos
- *                         los displays) con actividad, título, foco y capa
- *   windows.get_all     → todas las ventanas interactivas
- *   events.recent       → últimos cambios de ventana (pkg + clase + t)
- *   foreground.get      → ventana activa global + nº de ventanas por display
- *   action.back|home|recents|notifications|quick_settings|lock_screen|all_apps
- *                       → performGlobalAction (devuelve performed=true/false)
+ * v3 — IMPOSIBLE CONGELAR EL TELÉFONO:
+ *  · pool FIJO de 2 hilos (la v2 usaba newCachedThreadPool ILIMITADO:
+ *    con consultas lentas se apilaban hilos y saturaba el proceso).
+ *  · TODOS los handlers son instantáneos: leen caches volátiles
+ *    precalculados por el hilo de fondo (nunca PackageManager ni
+ *    binder pesado en el camino del request).
+ *  · rate-guard: >30 requests/seg se rechazan (cliente desbocado).
+ *  · ping informa user_id: si el agente quedó corriendo en un perfil
+ *    de trabajo (Island), la web lo detecta y avisa.
  *
- * Comandos v2 (lo que faltaba):
- *   apps.get            → apps lanzables con ETIQUETAS REALES y componente
- *                         exacto (am start -n directo, sin monkey)
- *   icons.get           → lote de íconos PNG base64 por paquetes
- *                         {"packages": ["com.x", "com.y"]}
- *   launcher.get        → launcher PREDETERMINADO del teléfono + todos los
- *                         HOME instalados (HOME determinista en la web)
- *   notifications.get   → notificaciones activas espejadas (app, ícono,
- *                         título, texto, ongoing, clearable)
- *   notification.dismiss {"key": "…"} → descartar desde la web
- *   notifications.clear_all → limpiar las descartables
+ * Comandos v1: ping · tasks.get_all · windows.get_all · events.recent ·
+ *              foreground.get · action.back|home|recents|notifications|
+ *              quick_settings|lock_screen|all_apps
+ * Comandos v2+: apps.get · icons.get · launcher.get · notifications.get ·
+ *               notification.dismiss · notifications.clear_all
+ * v3: apps.get/icons.get devuelven "pending" (el fondo aún está
+ *     calculando — la web reintente en ~1.5s).
  */
 public class AgentServer extends Thread {
 
     public static final int PORT = 8458;
     private static final String TAG = "DexPortAgent";
+    private static final int MAX_REQ_PER_SEC = 30;
 
     private final AgentAccessibilityService service;
     private volatile boolean running = false;
     private volatile ServerSocket serverSocket;
-    private final ExecutorService pool = Executors.newCachedThreadPool();
+    /** v3: pool FIJO — nunca más hilos que esto. */
+    private final ExecutorService pool = Executors.newFixedThreadPool(2);
+
+    /** rate-guard: requests en la ventana actual + inicio de ventana. */
+    private final AtomicInteger reqWindow = new AtomicInteger(0);
+    private final AtomicLong windowStart = new AtomicLong(0);
 
     public AgentServer(AgentAccessibilityService service) {
         super("DexPortAgentServer");
@@ -78,7 +82,7 @@ public class AgentServer extends Thread {
         try {
             // solo localhost: la web llega a través del túnel ADB
             serverSocket = new ServerSocket(PORT, 16, InetAddress.getLoopbackAddress());
-            Log.i(TAG, "Agent escuchando en 127.0.0.1:" + PORT);
+            Log.i(TAG, "Agent v3 escuchando en 127.0.0.1:" + PORT);
             while (running) {
                 final Socket client = serverSocket.accept();
                 try {
@@ -140,6 +144,10 @@ public class AgentServer extends Thread {
             if (line == null || line.trim().isEmpty()) {
                 return;
             }
+            if (!rateOk()) {
+                write(client, error(null, "rate limit"));
+                return;
+            }
             JSONObject req;
             try {
                 req = new JSONObject(line);
@@ -153,6 +161,18 @@ public class AgentServer extends Thread {
         } finally {
             closeQuietly(client);
         }
+    }
+
+    /** Máx N requests por segundo (ventana deslizante simple). */
+    private boolean rateOk() {
+        long now = System.currentTimeMillis();
+        long start = windowStart.get();
+        if (now - start >= 1_000) {
+            windowStart.set(now);
+            reqWindow.set(1);
+            return true;
+        }
+        return reqWindow.incrementAndGet() <= MAX_REQ_PER_SEC;
     }
 
     private void write(Socket client, JSONObject res) {
@@ -174,16 +194,22 @@ public class AgentServer extends Thread {
             switch (cmd == null ? "" : cmd) {
                 case "ping": {
                     res.put("service", "DexPort Agent");
-                    res.put("version", 2);
+                    res.put("version", 3);
                     res.put("sdk", Build.VERSION.SDK_INT);
                     res.put("android", Build.VERSION.RELEASE);
                     res.put("device", Build.MANUFACTURER + " " + Build.MODEL);
                     res.put("multi_display", Build.VERSION.SDK_INT >= 33);
                     res.put("notifications", AgentNotificationListener.isConnected());
+                    // v3: perfil en el que corre (0 = principal). Si la app
+                    // quedó duplicada en un perfil de trabajo (Island) la
+                    // web lo ve y la reinstala limpia.
+                    res.put("user_id", Process.myUid() / 100_000);
                     break;
                 }
                 case "apps.get": {
-                    res.put("apps", AppRegistry.get(service).appsJson());
+                    JSONObject state = AppRegistry.get(service).appsStateJson();
+                    res.put("apps", state.optJSONArray("apps"));
+                    res.put("pending", state.optBoolean("pending", false));
                     break;
                 }
                 case "icons.get": {
@@ -197,20 +223,24 @@ public class AgentServer extends Thread {
                             }
                         }
                     }
-                    res.put("icons", AppRegistry.get(service).iconsJson(pkgs));
+                    JSONObject icons = AppRegistry.get(service).iconsStateJson(pkgs);
+                    res.put("icons", icons.optJSONArray("icons"));
+                    res.put("pending", icons.optJSONArray("pending"));
                     break;
                 }
                 case "launcher.get": {
-                    res.put("launcher", AppRegistry.get(service).launcherJson());
+                    res.put("launcher", AppRegistry.get(service).launcherStateJson());
                     break;
                 }
                 case "notifications.get": {
-                    res.put("notifications", AgentNotificationListener.snapshotJson(service));
+                    res.put("notifications", AgentNotificationListener.snapshotJson(
+                            AgentNotificationListener.getInstance()));
                     break;
                 }
                 case "notification.dismiss": {
                     String key = req.optString("key", "");
-                    boolean ok = AgentNotificationListener.dismiss(key);
+                    boolean ok = AgentNotificationListener.dismiss(
+                            AgentNotificationListener.getInstance(), key);
                     res.put("performed", ok);
                     if (!ok) {
                         res.put("status", "error");
@@ -219,7 +249,8 @@ public class AgentServer extends Thread {
                     break;
                 }
                 case "notifications.clear_all": {
-                    boolean ok = AgentNotificationListener.clearAll();
+                    boolean ok = AgentNotificationListener.clearAll(
+                            AgentNotificationListener.getInstance());
                     res.put("performed", ok);
                     break;
                 }

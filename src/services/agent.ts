@@ -33,7 +33,7 @@ export const AGENT_SERVICE = "com.dexport.agent/com.dexport.agent.AgentAccessibi
 export const AGENT_NOTIF_LISTENER = "com.dexport.agent/com.dexport.agent.AgentNotificationListener";
 export const AGENT_APK_URL = "dexport-agent.apk";
 export const AGENT_APK_DEVICE_PATH = "/data/local/tmp/dexport-agent.apk";
-export const AGENT_APK_SIZE = 49_801;
+export const AGENT_APK_SIZE = 53_898;
 
 /** Tarea/app abierta según el agente (ventana TYPE_APPLICATION). */
 export interface AgentTask {
@@ -67,6 +67,8 @@ export interface AgentPing {
   multiDisplay: boolean;
   /** v2: true si el espejo de notificaciones tiene permiso */
   notifications: boolean;
+  /** v3: perfil en el que corre el agente (0 = principal; >0 = trabajo/Island) */
+  userId: number;
 }
 
 /** v2: app lanzable con etiqueta real (del PackageManager del teléfono). */
@@ -175,6 +177,7 @@ export class AgentBridge {
         device: String(res.device ?? ""),
         multiDisplay: res.multi_display === true,
         notifications: res.notifications === true,
+        userId: Number(res.user_id ?? 0),
       };
     } catch {
       return null;
@@ -239,44 +242,69 @@ export class AgentBridge {
   // v2: apps reales (labels + componentes + íconos)
   // ═════════════════════════════════════════════════════════
 
-  /** apps.get — apps lanzables con ETIQUETAS reales y componente exacto. */
-  async getApps(timeoutMs = 15_000): Promise<AgentAppInfo[]> {
-    const res = await this.request("apps.get", timeoutMs);
-    if (!res || !Array.isArray(res.apps)) return [];
-    const out: AgentAppInfo[] = [];
-    for (const raw of res.apps as Record<string, unknown>[]) {
-      const pkg = String(raw.package_name ?? "");
-      if (!pkg) continue;
-      out.push({
-        packageName: pkg,
-        label: String(raw.label ?? pkg),
-        component: String(raw.component ?? ""),
-        system: raw.system === true,
-      });
+  /**
+   * apps.get — apps lanzables con ETIQUETAS reales y componente exacto.
+   * v3: el agente responde instantáneo desde cache; si aún está
+   * enumerando (pending), espera y reintenta una vez.
+   */
+  async getApps(timeoutMs = 8_000): Promise<AgentAppInfo[]> {
+    const parse = (res: Record<string, unknown> | null): AgentAppInfo[] => {
+      if (!res || !Array.isArray(res.apps)) return [];
+      const out: AgentAppInfo[] = [];
+      for (const raw of res.apps as Record<string, unknown>[]) {
+        const pkg = String(raw.package_name ?? "");
+        if (!pkg) continue;
+        out.push({
+          packageName: pkg,
+          label: String(raw.label ?? pkg),
+          component: String(raw.component ?? ""),
+          system: raw.system === true,
+        });
+      }
+      return out;
+    };
+    let res = await this.request("apps.get", timeoutMs).catch(() => null);
+    let apps = parse(res);
+    if (apps.length === 0 && res?.pending === true) {
+      // el fondo del agente aún enumera (~1-2s) → reintento único
+      await sleep(2_000);
+      res = await this.request("apps.get", timeoutMs).catch(() => null);
+      apps = parse(res);
     }
-    return out;
+    return apps;
   }
 
   /**
-   * icons.get — lote de íconos PNG base64 (el agente renderiza el drawable
-   * del launcher a 64px). Máx. 12 paquetes por request para no saturar el
-   * túnel; devuelve pkg → dataURL.
+   * icons.get — v3: el agente NUNCA renderiza sincrono (congelaba el
+   * teléfono en v2). Devuelve los listos + la lista de "pending" que
+   * genera en fondo; hay que volver a preguntar en ~1.5s.
    */
-  async getIcons(packages: string[], timeoutMs = 20_000): Promise<Map<string, string>> {
+  async getIcons(
+    packages: string[],
+    timeoutMs = 10_000,
+  ): Promise<{ icons: Map<string, string>; pending: string[] }> {
     const out = new Map<string, string>();
-    if (packages.length === 0) return out;
-    const res = await this.request("icons.get", timeoutMs, {
-      packages: packages.slice(0, 12),
-    });
-    if (!res || !Array.isArray(res.icons)) return out;
-    for (const raw of res.icons as Record<string, unknown>[]) {
-      const pkg = String(raw.package_name ?? "");
-      const b64 = String(raw.icon ?? "");
-      if (pkg && b64.startsWith("iVBOR")) {
-        out.set(pkg, `data:image/png;base64,${b64}`);
+    if (packages.length === 0) return { icons: out, pending: [] };
+    const res = await this
+      .request("icons.get", timeoutMs, { packages: packages.slice(0, 12) })
+      .catch(() => null);
+    if (!res) return { icons: out, pending: [] };
+    if (Array.isArray(res.icons)) {
+      for (const raw of res.icons as Record<string, unknown>[]) {
+        const pkg = String(raw.package_name ?? "");
+        const b64 = String(raw.icon ?? "");
+        if (pkg && b64.startsWith("iVBOR")) {
+          out.set(pkg, `data:image/png;base64,${b64}`);
+        }
       }
     }
-    return out;
+    const pending: string[] = [];
+    if (Array.isArray(res.pending)) {
+      for (const p of res.pending) {
+        if (typeof p === "string" && p) pending.push(p);
+      }
+    }
+    return { icons: out, pending };
   }
 
   /** launcher.get — el launcher PREDETERMINADO del teléfono + todos los HOME. */
@@ -367,21 +395,55 @@ export class AgentBridge {
 
   // ═════════════════════════════════════════════════════════
   // Instalación por ADB (APK + permiso de accesibilidad)
+  // v3: SOLO en el perfil principal (user 0) + limpieza de
+  // duplicados en perfiles de trabajo (Island)
   // ═════════════════════════════════════════════════════════
 
   /**
-   * Flujo completo: descargar APK → push → pm install → conceder
-   * permiso de accesibilidad por settings put → verificar ping.
+   * v3: desinstala el agente de TODOS los perfiles que no sean el
+   * principal (0). `pm install` sin --user lo mete también en
+   * perfiles de trabajo (Island/Secure Folder en Samsung) → dos
+   * copias compitiendo por el puerto 8458 = conflictos y colas.
+   * Devuelve los ids de usuarios limpiados.
+   */
+  async cleanOtherProfiles(): Promise<number[]> {
+    try {
+      const users = await webAdb.shellSafe("pm list users 2>/dev/null", 6_000);
+      // "UserInfo{0:Owner:c13} running" / "UserInfo{10:Island:30}"
+      const ids: number[] = [];
+      for (const m of users.matchAll(/UserInfo\{(\d+):/g)) {
+        const id = Number(m[1]);
+        if (Number.isFinite(id) && id !== 0) ids.push(id);
+      }
+      if (ids.length === 0) return [];
+      const cleaned: number[] = [];
+      for (const id of ids) {
+        const out = await webAdb.shellSafe(
+          `pm uninstall --user ${id} ${AGENT_PKG} 2>/dev/null; true`,
+          8_000,
+        );
+        if (/Success/i.test(out)) cleaned.push(id);
+      }
+      return cleaned;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Flujo completo: descargar APK → push → pm install --user 0 →
+   * limpiar duplicados de perfiles de trabajo → conceder permisos
+   * por ADB → verificar ping.
    */
   async install(onProgress: ProgressCb = () => undefined): Promise<boolean> {
     const adb = webAdb.adb;
     if (!adb) throw new Error("Dispositivo no conectado");
 
-    // ── 1. Descargar el APK embebido en la web (50 KB, instantáneo) ──
+    // ── 1. Descargar el APK embebido en la web (54 KB, instantáneo) ──
     onProgress({
       phase: "downloading",
       progress: 0.05,
-      message: "Descargando DexPort Agent v2 (50 KB)…",
+      message: "Descargando DexPort Agent v3 (54 KB)…",
     });
     const response = await fetch(AGENT_APK_URL);
     if (!response.ok && !response.body) {
@@ -427,14 +489,16 @@ export class AgentBridge {
       }
     }
 
-    // ── 3. pm install (igual que `adb install -r`) ──
+    // ── 3. pm install SOLO en el perfil principal (user 0) ──
+    // sin --user, pm lo instala en TODOS los perfiles (incluido el
+    // perfil de trabajo Island) → copias duplicadas en conflicto.
     onProgress({
       phase: "installing",
       progress: 0.55,
-      message: "Instalando agente (pm install)…",
+      message: "Instalando agente (perfil principal)…",
     });
     const installOut = await webAdb.shellTimeout(
-      `pm install -r -g ${AGENT_APK_DEVICE_PATH} 2>&1`,
+      `pm install --user 0 -r -g ${AGENT_APK_DEVICE_PATH} 2>&1 || pm install -r -g ${AGENT_APK_DEVICE_PATH} 2>&1`,
       60_000,
     );
     if (!/Success/i.test(installOut)) {
@@ -447,6 +511,21 @@ export class AgentBridge {
       throw new Error(`pm install falló: ${reason.slice(0, 160)}`);
     }
     void webAdb.shellSafe(`rm -f ${AGENT_APK_DEVICE_PATH}`, 4_000);
+
+    // ── 3b. v3: limpiar duplicados en perfiles de trabajo (Island) ──
+    onProgress({
+      phase: "installing",
+      progress: 0.65,
+      message: "Limpiando duplicados en perfiles de trabajo…",
+    });
+    const cleaned = await this.cleanOtherProfiles();
+    if (cleaned.length > 0) {
+      onProgress({
+        phase: "installing",
+        progress: 0.7,
+        message: `Agente duplicado eliminado de ${cleaned.length} perfil(es) de trabajo`,
+      });
+    }
 
     // ── 4. Conceder el permiso de ACCESIBILIDAD por ADB ──
     onProgress({

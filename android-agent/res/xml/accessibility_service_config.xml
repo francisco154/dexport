@@ -1,20 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Config del AccessibilityService del DexPort Agent.
+  Config del AccessibilityService del DexPort Agent (v3 — RECONSTRUIDO).
 
+  Lecciones de la v2 (congelaba el sistema):
+  · canRetrieveWindowContent="true" hacía que Android PREFETCHARA el árbol
+    de nodos de TODAS las apps del teléfono en cada evento — un impuesto
+    sobre el hilo UI de cada app → el sistema entero se tildaba.
+  · w.getRoot() en tasks.get_all era una llamada binder POR VENTANA al hilo
+    UI de cada app: con apps ocupadas tardaba segundos y apilaba hilos.
+
+  v3:
+  · Solo typeWindowStateChanged (pkg + clase Activity — barato, sin nodos).
+  · canRetrieveWindowContent="false" → CERO prefetch, CERO getRoot.
   · flagRetrieveInteractiveWindows → getWindows()/getWindowsOnAllDisplays()
-    devuelven TODAS las ventanas interactivas (incluidas las del display
-    virtual de scrcpy y las ventanas freeform estilo DeX).
-  · typeWindowStateChanged → captura cada cambio de actividad en primer
-    plano (paquete + clase Activity) — la señal más fiable para saber
-    «qué app se abrió / quedó al frente» sin parsear dumpsys.
-  · typeWindowsChanged → aviso de que la lista de ventanas cambió
-    (apertura/cierre/minimizado) — el snapshot se consulta bajo demanda.
+    siguen funcionando (una sola llamada binder que devuelve los METADATOS
+    de todas las ventanas; el paquete de cada una se deduce del mapa
+    windowId→pkg que alimentan los propios eventos).
+  · notificationTimeout=500 → el sistema agrupa ráfagas de eventos.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagRetrieveInteractiveWindows"
-    android:canRetrieveWindowContent="true"
+    android:canRetrieveWindowContent="false"
     android:description="@string/acc_description"
-    android:notificationTimeout="150" />
+    android:notificationTimeout="500" />

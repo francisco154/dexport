@@ -15,27 +15,28 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * DexPort Agent — servicio de accesibilidad.
+ * DexPort Agent v3 — servicio de accesibilidad RECONSTRUIDO.
  * ════════════════════════════════════════════════════════════
- * Mapea todo lo que ADB no puede ver y lo sirve por TCP (8458):
+ * La v2 congelaba el teléfono por dos motivos que aquí NO existen:
  *
- *  · Ventanas interactivas de TODAS las pantallas — API 33+ expone
- *    getWindowsOnAllDisplays() (teléfono + display virtual scrcpy +
- *    ventanas freeform DeX). En API < 33 getWindows() sin display,
- *    la web lo cruza con dumpsys.
- *  · Apps abiertas (tareas): ventanas TYPE_APPLICATION con paquete,
- *    actividad (deducida del último TYPE_WINDOW_STATE_CHANGED),
- *    título, foco y capa.
- *  · App en primer plano (la ventana isActive() global).
- *  · Acciones globales: ATRÁS / HOME / RECIENTES / notificaciones /
- *    ajustes rápidos / bloquear pantalla — más fiables que los
- *    keyevents planos porque actúan sobre la ventana enfocada
- *    aunque esté en el display virtual.
+ *  1. canRetrieveWindowContent=true → el sistema prefetchaba el árbol
+ *     de nodos de TODAS las apps en cada evento (impuesto sobre cada
+ *     hilo UI del sistema). v3: false — solo metadatos de eventos.
+ *  2. w.getRoot() por ventana en cada consulta (llamada binder al hilo
+ *     UI de cada app, de milisegundos a SEGUNDOS si la app estaba
+ *     ocupada). v3: CERO getRoot — el paquete de cada ventana se deduce
+ *     del mapa windowId→paquete que alimentan los propios eventos
+ *     TYPE_WINDOW_STATE_CHANGED (baratos: llegan de todas formas).
  *
- * El servidor arranca solo en onServiceConnected() (o sea, en cuanto
- * DexPort activa el permiso por ADB) y muere en onUnbind/onDestroy.
+ * El handler de eventos es O(1) en alocaciones y NO toca PackageManager,
+ * ni binder, ni locks compartidos con el servidor: imposible bloquear el
+ * input aunque el resto del agente esté saturado.
+ *
+ * El servidor arranca en onServiceConnected() y muere en onUnbind().
  */
 public class AgentAccessibilityService extends AccessibilityService {
 
@@ -57,6 +58,15 @@ public class AgentAccessibilityService extends AccessibilityService {
     /** Historial circular de últimos eventos WINDOW_STATE_CHANGED. */
     private final Deque<Ev> recent = new ArrayDeque<>();
 
+    /**
+     * v3: windowId → paquete (alimentado por los propios eventos, sin
+     * binder). Copy-on-write: el escritor (hilo principal) copia el mapa
+     * entero — los lectores (hilos del servidor) nunca ven estado a medias
+     * y NADIE toma un lock. ~64 entradas sobra para teléfono + display
+     * virtual + ventanas freeform.
+     */
+    private volatile Map<Integer, String> windowPkg = new ConcurrentHashMap<>();
+
     public static AgentAccessibilityService getInstance() {
         return sInstance;
     }
@@ -74,7 +84,9 @@ public class AgentAccessibilityService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         sInstance = this;
-        // garantizar el flag de ventanas interactivas (también está en el XML)
+        // garantizar el flag de ventanas interactivas (también en el XML).
+        // OJO: NADA de flags de touch-exploration ni filter-key-events —
+        // esos son los que rompen el táctil/teclado del teléfono.
         try {
             AccessibilityServiceInfo info = getServiceInfo();
             if (info != null) {
@@ -88,6 +100,11 @@ public class AgentAccessibilityService extends AccessibilityService {
             server = new AgentServer(this);
             server.start();
         }
+
+        // v3: precalentar el registro en el hilo de fondo (apps, labels,
+        // launcher) para que las primeras consultas de la web ya respondan
+        // al instante con datos calientes.
+        AppRegistry.get(this).prewarm();
     }
 
     @Override
@@ -109,13 +126,14 @@ public class AgentAccessibilityService extends AccessibilityService {
         if (s != null) {
             s.shutdown();
         }
+        AppRegistry.shutdownShared();
         if (sInstance == this) {
             sInstance = null;
         }
     }
 
     // ═════════════════════════════════════════════════════════
-    // Eventos
+    // Eventos — ultraligero (hilo principal)
     // ═════════════════════════════════════════════════════════
 
     @Override
@@ -123,21 +141,45 @@ public class AgentAccessibilityService extends AccessibilityService {
         if (event == null) {
             return;
         }
-        int type = event.getEventType();
-        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            String pkg = safe(event.getPackageName());
-            String cls = safe(event.getClassName());
-            if (pkg != null && !pkg.isEmpty()) {
-                synchronized (recent) {
-                    recent.addLast(new Ev(System.currentTimeMillis(), pkg, cls == null ? "" : cls));
-                    while (recent.size() > 200) {
-                        recent.removeFirst();
-                    }
-                }
+        if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return;
+        }
+        String pkg = safe(event.getPackageName());
+        if (pkg == null || pkg.isEmpty() || "com.dexport.agent".equals(pkg)) {
+            return;
+        }
+        String cls = safe(event.getClassName());
+        long now = System.currentTimeMillis();
+
+        // 1) historial (para deducir la Activity de cada paquete)
+        synchronized (recent) {
+            recent.addLast(new Ev(now, pkg, cls == null ? "" : cls));
+            while (recent.size() > 200) {
+                recent.removeFirst();
             }
         }
-        // TYPE_WINDOWS_CHANGED / TYPE_WINDOW_CONTENT_CHANGED: el snapshot
-        // de ventanas se consulta bajo demanda (getWindows*), nada que guardar.
+
+        // 2) mapa windowId→pkg — copy-on-write, sin locks de lectura
+        int windowId = event.getWindowId();
+        if (windowId > 0) {
+            Map<Integer, String> next = new ConcurrentHashMap<>(windowPkg);
+            next.put(windowId, pkg);
+            while (next.size() > 64) {
+                // podar la primera entrada (la más vieja en la práctica:
+                // los ids crecen monótonamente)
+                int oldest = Integer.MAX_VALUE;
+                for (Integer k : next.keySet()) {
+                    if (k != null && k < oldest) {
+                        oldest = k;
+                    }
+                }
+                if (oldest == Integer.MAX_VALUE) {
+                    break;
+                }
+                next.remove(oldest);
+            }
+            windowPkg = next;
+        }
     }
 
     @Override
@@ -147,6 +189,8 @@ public class AgentAccessibilityService extends AccessibilityService {
 
     // ═════════════════════════════════════════════════════════
     // Snapshot JSON para el AgentServer
+    // (v3: SIN getRoot() — todo son getters locales de la lista de
+    //  ventanas + el mapa windowId→pkg. Una llamada binder TOTAL.)
     // ═════════════════════════════════════════════════════════
 
     /** Tareas (apps abiertas): ventanas TYPE_APPLICATION de todos los displays. */
@@ -182,22 +226,6 @@ public class AgentAccessibilityService extends AccessibilityService {
         appendWindows(out, ws, displayId, true);
     }
 
-    /**
-     * Paquete de una ventana: AccessibilityWindowInfo no expone
-     * getPackageName() — se obtiene del nodo raíz (requiere
-     * canRetrieveWindowContent=true, que está activo).
-     */
-    private static String windowPackage(AccessibilityWindowInfo w) {
-        try {
-            android.view.accessibility.AccessibilityNodeInfo root = w.getRoot();
-            if (root != null) {
-                return safe(root.getPackageName());
-            }
-        } catch (Exception ignored) {
-        }
-        return null;
-    }
-
     private void appendWindows(
             JSONArray out,
             List<AccessibilityWindowInfo> ws,
@@ -215,8 +243,11 @@ public class AgentAccessibilityService extends AccessibilityService {
             if (appsOnly && type != AccessibilityWindowInfo.TYPE_APPLICATION) {
                 continue;
             }
-            String pkg = windowPackage(w);
+            // v3: paquete por el mapa de eventos (sin getRoot)
+            String pkg = windowPkg.get(w.getId());
             if (pkg == null || pkg.isEmpty()) {
+                // ventana abierta antes de que el agente se conectara —
+                // la web la cruza con dumpsys (fuente multi-v8)
                 continue;
             }
             JSONObject o = new JSONObject();
@@ -253,7 +284,7 @@ public class AgentAccessibilityService extends AccessibilityService {
             out.put("package_name", "");
             return out;
         }
-        String pkg = windowPackage(active);
+        String pkg = windowPkg.get(active.getId());
         out.put("package_name", pkg == null ? "" : pkg);
         String act = pkg == null ? null : componentFor(pkg);
         out.put("activity", act == null ? "" : act);
@@ -317,8 +348,7 @@ public class AgentAccessibilityService extends AccessibilityService {
 
     /**
      * Deduce el componente "pkg/.Activity" de un paquete a partir del
-     * último evento WINDOW_STATE_CHANGED cuya clase parezca una Activity
-     * (empieza por el paquete y no es una vista de android.*).
+     * último evento WINDOW_STATE_CHANGED cuya clase parezca una Activity.
      */
     private String componentFor(String pkg) {
         if (pkg == null || pkg.isEmpty()) {
@@ -342,8 +372,6 @@ public class AgentAccessibilityService extends AccessibilityService {
                 continue;
             }
             if (cls.equals(pkg) || cls.startsWith(pkg + ".")) {
-                // "com.x.HomeActivity" → "com.x/com.x.HomeActivity"
-                // "com.x..HomeActivity" no ocurre; clases relativas vienen completas
                 return pkg + "/" + cls;
             }
             // clase de otro paquete (p.ej. actividad de biblioteca) → úsala igual

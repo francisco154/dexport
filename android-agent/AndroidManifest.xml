@@ -1,24 +1,41 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  DexPort Agent — manifiesto
+  DexPort Agent — manifiesto (v3)
   ════════════════════════════════════════════════════════════
-  App auxiliar con permiso de ACCESIBILIDAD que expone por TCP
-  (localhost:8458, protocolo de líneas JSON idéntico al companion
-  original) todo lo que ADB no puede ver:
+  App auxiliar del proyecto DexPort (web). v3 RECONSTRUIDA para no
+  interferir jamás con el rendimiento del teléfono:
 
-    · ventanas interactivas de TODAS las pantallas (teléfono +
-      display virtual scrcpy) con paquete, título, foco y display
-    · apps abiertas reales (tareas) con su actividad
-    · eventos de cambio de ventana (actividad en primer plano)
-    · acciones globales fiables (ATRÁS/HOME/RECIENTES/notifs)
+    · servicio de accesibilidad LIGERO (solo eventos de cambio de
+      ventana, sin prefetch de nodos, sin getRoot)
+    · TODO el trabajo pesado (enumerar apps, labels, íconos) pasa por
+      UN solo hilo de fondo de baja prioridad — nunca el hilo principal
+      ni los hilos del servidor TCP
+    · lista COMPLETA de apps instaladas (QUERY_ALL_PACKAGES + <queries>;
+      Android 11+ filtra los paquetes visibles si no se declaran)
+    · espejo de notificaciones con snapshot VIVO en memoria (sin
+      getActiveNotifications() en cada consulta)
 
-  La web de DexPort lo consulta vía adb.createSocket("tcp:8458").
+  La web lo consulta vía adb.createSocket("tcp:8458").
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dexport.agent">
 
     <!-- ServerSocket localhost:8458 -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- v3: lista COMPLETA de apps. App sideloaded por ADB (no Play
+         Store): el permiso QUERY_ALL_PACKAGES está permitido para uso
+         propio/dispositivo personal, que es exactamente este caso. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <!-- v3: visibilidad total de apps lanzables (redundante con lo de
+         arriba, pero explícito para queryIntentActivities en 11+) -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <uses-sdk
         android:minSdkVersion="26"
@@ -52,7 +69,7 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
-        <!-- v2: espejo de notificaciones (se activa por ADB con
+        <!-- v2+: espejo de notificaciones (se activa por ADB con
              `cmd notification allow_listener com.dexport.agent/.AgentNotificationListener`) -->
         <service
             android:name=".AgentNotificationListener"
